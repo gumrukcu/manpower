@@ -314,7 +314,7 @@ else:
     # Sidebar params
     with st.sidebar:
         st.header("Parameters")
-        weeks = st.number_input("Weeks", min_value=1, max_value=52, value=4)
+        weeks = st.number_input("Weeks", min_value=1, max_value=52, value=1)
         workdays = st.number_input("Workdays per week", min_value=1, max_value=7, value=5)
         daily_capacity = st.number_input("Daily capacity (minutes)", min_value=60, max_value=1440, value=480)
         speed = st.number_input("Avg speed (km/h)", min_value=1.0, max_value=200.0, value=30.0)
