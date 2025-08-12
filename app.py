@@ -195,7 +195,6 @@ if view == "map":
             xlsx_bytes = up2.read()
 
     if xlsx_bytes is None:
-        st.info("No schedule found. Generate on Home or upload a Schedule file.")
         st.stop()
 
     try:
@@ -311,8 +310,6 @@ else:
             help="Must include the expected columns used by your script."
         )
         st.caption("Required: City, Store Name, Estimated Duration In a store, Frequency per week. Optional: Lat, Long, Cluster.")
-    with col2:
-        st.info("Your original script is called as-is via subprocess. No logic is modified.")
 
     # Sidebar params
     with st.sidebar:
@@ -393,7 +390,3 @@ else:
                 st.download_button("⬇️ Download Excel (Schedule, Summary, DailyKM, Weekly_KM)",
                                    data=xlsx_bytes, file_name=DEFAULT_OUTPUT_NAME,
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-                if st.button("Open Map View"):
-                    st.query_params["view"] = "map"
-                    st.rerun()
