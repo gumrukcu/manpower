@@ -382,7 +382,7 @@ def main():
     p = argparse.ArgumentParser(description="Merchandiser scheduler with clustering, merge, and reporting.")
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--weeks", type=int, default=4)
+    p.add_argument("--weeks", type=int, default=1)
     p.add_argument("--workdays", type=int, default=5)
     p.add_argument("--daily_capacity", type=float, default=480)
     p.add_argument("--speed", type=float, default=30, help="Avg speed km/h for distance-based travel time")
