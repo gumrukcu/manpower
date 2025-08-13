@@ -317,7 +317,7 @@ else:
         weeks = st.number_input("Weeks", min_value=1, max_value=52, value=1)
         workdays = st.number_input("Workdays per week", min_value=1, max_value=7, value=5)
         daily_capacity = st.number_input("Daily capacity (minutes)", min_value=60, max_value=1440, value=480)
-        speed = st.number_input("Avg speed (km/h)", min_value=1.0, max_value=200.0, value=30.0)
+        speed = st.number_input("Avg speed (mph)", min_value=1.0, max_value=200.0, value=30.0)
 
         default_travel_set = st.toggle("Use fixed travel minutes per hop?", value=False)
         default_travel = None
