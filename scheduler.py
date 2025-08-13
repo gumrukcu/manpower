@@ -447,6 +447,20 @@ def main():
     actual_total = len(sched)
     print(f"✅ Expected visits: {expected_total}, Scheduled visits: {actual_total}")
     print(f"👥 Total merchandisers used: {after}")
+    # ---- effort-based merchandisers (FTE over the scheduled period) ----
+    # total minutes = sum of in-store duration + travel across all visits in the plan
+    total_minutes_for_period = float(sched["Duration"].astype(float).sum()) + \
+        float(pd.to_numeric(sched.get("ActualTravel", 0.0), errors="coerce").fillna(0.0).sum())
+
+    # denominator = daily capacity * number of working days per merch in the whole period
+    denom = float(args.daily_capacity) * max(1, args.workdays) * max(1, args.weeks)
+    effort_merch = (total_minutes_for_period / denom) if denom > 0 else 0.0
+
+    # print right under the merch count
+    print(f"🧮 Effort-based merchandisers "
+          f"(total_minutes / (daily_capacity×workdays×weeks)): "
+          f"{effort_merch:.2f} (ceil={math.ceil(effort_merch)})")
+
 
     # ---- reporting: minutes ----
     sched["PerVisit_Minutes"] = sched["Duration"].astype(float) + pd.to_numeric(
