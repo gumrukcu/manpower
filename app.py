@@ -324,13 +324,13 @@ else:
         if default_travel_set:
             default_travel = st.number_input("Fixed travel minutes per hop", min_value=0.0, max_value=300.0, value=0.0)
 
-        max_km_same_day = st.number_input("Max km between same-day visits", min_value=0.0, max_value=1000.0, value=50.0)
+        max_km_same_day = st.number_input("Max miles between same-day visits", min_value=0.0, max_value=1000.0, value=50.0)
         strict_same_merch = st.checkbox("Strict same merch per store", value=False)
 
         st.divider(); st.subheader("Clustering")
         cluster_mode = st.selectbox("Cluster mode", options=["kmeans","radius"], index=0)
         clusters = st.text_input("KMeans k (leave blank for auto)", value="")
-        cluster_radius_km = st.text_input("Radius (km) for DBSCAN (if radius mode)", value="")
+        cluster_radius_km = st.text_input("Radius (miles) for DBSCAN (if radius mode)", value="")
 
         st.divider(); st.subheader("Distance + Frequency")
         distance_model = st.selectbox("Distance model", options=["haversine","euclidean"], index=0)
