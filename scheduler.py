@@ -68,16 +68,16 @@ def load_and_prepare_data(
     df = pd.read_excel(file_path)
 
     # normalize numerics
-    for col in ["Lat","Long","Estimated Duration In a store","Estimated Travel Time","Frequency per week","Cluster"]:
+    for col in ["Lat","Long","Estimated Duration In a store","Estimated Travel Time","Frequency","Cluster"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    required = ["City","Store Name","Estimated Duration In a store","Frequency per week"]
+    required = ["City","Store Name","Estimated Duration In a store","Frequency"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    df = df.dropna(subset=["Estimated Duration In a store","Frequency per week"]).copy()
+    df = df.dropna(subset=["Estimated Duration In a store","Frequency"]).copy()
 
     # Respect existing clusters if present
     if "Cluster" in df.columns and df["Cluster"].notna().any():
@@ -143,15 +143,34 @@ def schedule_with_constraints(
     max_km_same_day: float,
     strict_same_merch: bool,
     distance_model: str,
-    freq_is_total: bool,
+    frequency_period: str,     # "week" or "month"
+    month_weeks: float,        # weeks per month scalar (e.g., 4.345)
 ) -> pd.DataFrame:
     df = full_df.copy()
 
-    # visits to plan
-    if freq_is_total:
-        df["Total Visits"] = df["Frequency per week"].round().astype(int)
+    # ---- visits to plan (weekly/monthly logic) ----
+    base_freq = pd.to_numeric(df["Frequency"], errors="coerce").fillna(0.0)
+
+    # Optional per-row override via column 'Frequency Period'
+    if "Frequency Period" in df.columns:
+        row_period = (
+            df["Frequency Period"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .where(lambda s: s.isin(["week", "month"]))
+        )
     else:
-        df["Total Visits"] = (df["Frequency per week"] * weeks).round().astype(int)
+        row_period = pd.Series([None] * len(df))
+
+    mw = float(month_weeks) if month_weeks and month_weeks > 0 else 4.345
+
+    def _factor(idx: int) -> float:
+        p = row_period.iat[idx] if row_period.iat[idx] in ("week", "month") else frequency_period
+        return (weeks / mw) if p == "month" else float(weeks)
+
+    factors = np.array([_factor(i) for i in range(len(df))], dtype=float)
+    df["Total Visits"] = np.maximum(0, np.rint(base_freq.to_numpy() * factors)).astype(int)
 
     # calendar labels
     weekdays_all = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
@@ -179,7 +198,8 @@ def schedule_with_constraints(
         merch_id = 1
 
         for store, visits in tasks_by_store.items():
-            start_idx = hash(store) % day_count
+            start_idx = hash(store) % day_count  # deterministic within one process
+
             preferred_merch = store_merch_map.get(store) if strict_same_merch else None
             merch_pool = [preferred_merch] if (preferred_merch and preferred_merch in merch_schedules) else \
                          list(merch_schedules.keys()) + [f"Merch_{cluster_id}_{merch_id}"]
@@ -375,6 +395,34 @@ def compute_day_km(sched_df: pd.DataFrame, *, distance_model: str):
     return df, day_km, merch_km
 
 # =========================
+# Helpers
+# =========================
+
+def compute_expected_total_visits(src_df: pd.DataFrame, weeks: int, frequency_period: str, month_weeks: float) -> int:
+    """Recompute expected total visits (mirrors schedule_with_constraints logic)."""
+    df = src_df.copy()
+    base = pd.to_numeric(df["Frequency"], errors="coerce").fillna(0.0)
+
+    if "Frequency Period" in df.columns:
+        row_period = (
+            df["Frequency Period"]
+            .astype(str).str.strip().str.lower()
+            .where(lambda s: s.isin(["week","month"]))
+        )
+    else:
+        row_period = pd.Series([None]*len(df))
+
+    mw = float(month_weeks) if month_weeks and month_weeks > 0 else 4.345
+
+    def _factor(idx: int) -> float:
+        p = row_period.iat[idx] if row_period.iat[idx] in ("week","month") else frequency_period
+        return (weeks / mw) if p == "month" else float(weeks)
+
+    factors = np.array([_factor(i) for i in range(len(df))], dtype=float)
+    total = np.maximum(0, np.rint(base.to_numpy() * factors)).astype(int).sum()
+    return int(total)
+
+# =========================
 # CLI
 # =========================
 
@@ -393,8 +441,6 @@ def main():
     p.add_argument("--cluster_mode", choices=["kmeans","radius"], default="kmeans")
     p.add_argument("--cluster_radius_km", type=float, default=None)
     p.add_argument("--distance_model", choices=["haversine","euclidean"], default="haversine")
-    p.add_argument("--freq_is_total", action="store_true",
-                   help="Treat 'Frequency per week' as TOTAL to schedule (ignore --weeks)")
     p.add_argument("--merge_utilization_threshold", type=float, default=0.0,
                    help="Merge merchs with avg daily utilization below this fraction of daily capacity (0 disables merging)")
     p.add_argument("--merge_cross_cluster", action="store_true",
@@ -402,9 +448,22 @@ def main():
     p.add_argument("--cache_precision", type=int, default=5,
                    help="Round lat/long decimals for haversine cache (higher=more precise, lower=faster)")
     p.add_argument("--verbose", action="store_true")
+
+    # NEW: frequency interpretation controls
+    p.add_argument("--frequency_period",
+                   choices=["week", "month"],
+                   default="week",
+                   help="Interpret 'Frequency' as per-week or per-month.")
+    p.add_argument("--month_weeks",
+                   type=float,
+                   default=4.345,
+                   help="Number of weeks per month when frequency_period=month (e.g., 4.0 or 4.345).")
+
     args = p.parse_args()
 
-    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(message)s")
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
+                        format="%(message)s")
+
     _set_cache_precision(args.cache_precision)
 
     df = load_and_prepare_data(
@@ -425,7 +484,8 @@ def main():
         max_km_same_day=args.max_km_same_day,
         strict_same_merch=args.strict_same_merch,
         distance_model=args.distance_model,
-        freq_is_total=args.freq_is_total,
+        frequency_period=args.frequency_period,
+        month_weeks=args.month_weeks,
     )
 
     # Optional merge
@@ -442,25 +502,24 @@ def main():
     if args.merge_utilization_threshold > 0 and after < before:
         logging.info(f"🔄 Merged merchs: {before} → {after}")
 
-    # Expected vs actual
-    expected_total = int((df["Frequency per week"] if args.freq_is_total else (df["Frequency per week"] * args.weeks)).round().sum())
+    # Expected vs actual (recomputed safely)
+    expected_total = compute_expected_total_visits(
+        df, weeks=args.weeks, frequency_period=args.frequency_period, month_weeks=args.month_weeks
+    )
     actual_total = len(sched)
     print(f"✅ Expected visits: {expected_total}, Scheduled visits: {actual_total}")
     print(f"👥 Total merchandisers used: {after}")
+
     # ---- effort-based merchandisers (FTE over the scheduled period) ----
-    # total minutes = sum of in-store duration + travel across all visits in the plan
     total_minutes_for_period = float(sched["Duration"].astype(float).sum()) + \
         float(pd.to_numeric(sched.get("ActualTravel", 0.0), errors="coerce").fillna(0.0).sum())
 
-    # denominator = daily capacity * number of working days per merch in the whole period
     denom = float(args.daily_capacity) * max(1, args.workdays) * max(1, args.weeks)
     effort_merch = (total_minutes_for_period / denom) if denom > 0 else 0.0
 
-    # print right under the merch count
     print(f"🧮 Effort-based merchandisers "
           f"(total_minutes / (daily_capacity×workdays×weeks)): "
           f"{effort_merch:.2f} (ceil={math.ceil(effort_merch)})")
-
 
     # ---- reporting: minutes ----
     sched["PerVisit_Minutes"] = sched["Duration"].astype(float) + pd.to_numeric(
