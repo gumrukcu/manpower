@@ -12,7 +12,7 @@ from streamlit_folium import st_folium
 # ======================
 # Config & simple styles
 # ======================
-SCRIPT_PATH = os.environ.get("SCHEDULER_SCRIPT", "scheduler.py")  # your unchanged script
+SCRIPT_PATH = os.environ.get("SCHEDULER_SCRIPT", "scheduler.py")  # your updated script
 DEFAULT_OUTPUT_NAME = "schedule_output.xlsx"
 PAGE_TITLE = "Merchandiser Scheduler"
 PAGE_ICON = "📅"
@@ -70,8 +70,11 @@ def build_cli_args(params: dict) -> list[str]:
     if params["cluster_radius_km"]:
         add_flag("--cluster_radius_km", params["cluster_radius_km"])
     add_flag("--distance_model", params["distance_model"])
-    if params["freq_is_total"]:
-        args.append("--freq_is_total")
+
+    # NEW: frequency controls
+    add_flag("--frequency_period", params["frequency_period"])
+    add_flag("--month_weeks", params["month_weeks"])
+
     add_flag("--merge_utilization_threshold", params["merge_utilization_threshold"])
     if params["merge_cross_cluster"]:
         args.append("--merge_cross_cluster")
@@ -298,7 +301,7 @@ if view == "map":
 else:
     render_linkbar()
     st.markdown(
-        '<div class="title"><h1>Merchandiser Scheduler <span class="pill">no code changes</span></h1>'
+        '<div class="title"><h1>Merchandiser Scheduler <span class="pill">web UI</span></h1>'
         '<p class="small-muted">Upload your Excel, configure options, generate the plan — then jump to the Map view.</p></div>',
         unsafe_allow_html=True
     )
@@ -307,34 +310,37 @@ else:
     with col1:
         uploaded = st.file_uploader(
             "Upload input Excel", type=["xlsx", "xls"],
-            help="Must include the expected columns used by your script."
+            help="Required columns: City, Store Name, Estimated Duration In a store, Frequency. Optional: Lat, Long, Cluster, Frequency Period."
         )
-        st.caption("Required: City, Store Name, Estimated Duration In a store, Frequency per week. Optional: Lat, Long, Cluster.")
+        st.caption("Tip: Use 'Frequency Period' column (week/month) for per-row overrides. Otherwise choose it below in the UI.")
 
     # Sidebar params
     with st.sidebar:
         st.header("Parameters")
-        weeks = st.number_input("Weeks", min_value=1, max_value=52, value=1)
+        weeks = st.number_input("Weeks to schedule", min_value=1, max_value=52, value=4)
         workdays = st.number_input("Workdays per week", min_value=1, max_value=7, value=5)
         daily_capacity = st.number_input("Daily capacity (minutes)", min_value=60, max_value=1440, value=480)
-        speed = st.number_input("Avg speed (mph)", min_value=1.0, max_value=200.0, value=30.0)
+        speed = st.number_input("Avg speed (km/h)", min_value=1.0, max_value=200.0, value=30.0)
 
         default_travel_set = st.toggle("Use fixed travel minutes per hop?", value=False)
         default_travel = None
         if default_travel_set:
             default_travel = st.number_input("Fixed travel minutes per hop", min_value=0.0, max_value=300.0, value=0.0)
 
-        max_km_same_day = st.number_input("Max miles between same-day visits", min_value=0.0, max_value=1000.0, value=50.0)
+        max_km_same_day = st.number_input("Max distance between same-day visits (km)", min_value=0.0, max_value=1000.0, value=50.0)
         strict_same_merch = st.checkbox("Strict same merch per store", value=False)
 
         st.divider(); st.subheader("Clustering")
         cluster_mode = st.selectbox("Cluster mode", options=["kmeans","radius"], index=0)
         clusters = st.text_input("KMeans k (leave blank for auto)", value="")
-        cluster_radius_km = st.text_input("Radius (miles) for DBSCAN (if radius mode)", value="")
+        cluster_radius_km = st.text_input("Radius (km) for DBSCAN (if radius mode)", value="")
 
-        st.divider(); st.subheader("Distance + Frequency")
+        st.divider(); st.subheader("Distance & Frequency")
         distance_model = st.selectbox("Distance model", options=["haversine","euclidean"], index=0)
-        freq_is_total = st.checkbox("'Frequency per week' is TOTAL to schedule (ignore Weeks)")
+
+        # NEW: frequency controls (replace old freq_is_total)
+        frequency_period = st.selectbox("Interpret 'Frequency' values as", options=["week","month"], index=0)
+        month_weeks = st.number_input("Weeks per month (used if 'month')", min_value=1.0, max_value=6.0, value=4.345, step=0.005, format="%.3f")
 
         st.divider(); st.subheader("Merge underutilized")
         merge_utilization_threshold = st.slider("Utilization threshold (0 disables)", 0.0, 1.0, 0.0, 0.05)
@@ -362,7 +368,9 @@ else:
                 speed=speed, default_travel_set=default_travel_set, default_travel=default_travel,
                 max_km_same_day=max_km_same_day, strict_same_merch=strict_same_merch,
                 clusters=clusters.strip(), cluster_mode=cluster_mode, cluster_radius_km=cluster_radius_km.strip(),
-                distance_model=distance_model, freq_is_total=freq_is_total,
+                distance_model=distance_model,
+                # NEW:
+                frequency_period=frequency_period, month_weeks=month_weeks,
                 merge_utilization_threshold=merge_utilization_threshold, merge_cross_cluster=merge_cross_cluster,
                 cache_precision=cache_precision, verbose=verbose,
             )
