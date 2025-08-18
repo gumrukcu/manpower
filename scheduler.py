@@ -172,33 +172,115 @@ def schedule_with_constraints(
     factors = np.array([_factor(i) for i in range(len(df))], dtype=float)
     df["Total Visits"] = np.maximum(0, np.rint(base_freq.to_numpy() * factors)).astype(int)
 
+    # record effective period per row for placement rules
+    eff_period = []
+    for i in range(len(df)):
+        p = row_period.iat[i] if row_period.iat[i] in ("week","month") else frequency_period
+        eff_period.append(p)
+    df["_FreqPeriod"] = eff_period  # "week" or "month"
+
     # calendar labels
     weekdays_all = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
     workdays = max(1, min(int(workdays), 7))
-    day_names = weekdays_all[:workdays]
+    day_names = weekdays_all[:workdays]                     # e.g., Mon..Fri
     days = [f"Week{w+1}-{d}" for w in range(weeks) for d in day_names]
     day_count = len(days)
 
+    # ------------ helpers to spread evenly ------------
+    def spread_weeks_evenly(n_visits: int, weeks_count: int) -> list[int]:
+        """Return week ids (1..weeks_count) distributing n_visits as evenly as possible."""
+        if weeks_count <= 0 or n_visits <= 0:
+            return []
+        base = n_visits // weeks_count
+        rem = n_visits % weeks_count
+        # each week gets 'base', first 'rem' weeks get +1
+        buckets = {w: [w] * (base + (1 if w <= rem else 0)) for w in range(1, weeks_count + 1)}
+        # round-robin interleave
+        out = []
+        while any(buckets[w] for w in buckets):
+            for w in range(1, weeks_count + 1):
+                if buckets[w]:
+                    out.append(buckets[w].pop(0))
+        return out
+
+    def days_for_week(week_id: int) -> list[str]:
+        prefix = f"Week{int(week_id)}-"
+        return [d for d in days if d.startswith(prefix)]
+
+    def spread_days_evenly(n_visits_week: int) -> list[str]:
+        """Return day-name labels (Mon..Fri etc.) distributed evenly within a week."""
+        if n_visits_week <= 0:
+            return []
+        base = n_visits_week // len(day_names)
+        rem = n_visits_week % len(day_names)
+        # build buckets for each day of week
+        buckets = {d: [d] * (base + (1 if i < rem else 0)) for i, d in enumerate(day_names)}
+        out = []
+        while any(buckets[d] for d in buckets):
+            for d in day_names:
+                if buckets[d]:
+                    out.append(buckets[d].pop(0))
+        return out
+    # --------------------------------------------------
+
     all_schedules = []
     for cluster_id, group in df.groupby("Cluster"):
+        # Build visit tasks, pre-assign preferred week/day for monthly rows
         tasks_by_store = defaultdict(list)
+
         for _, row in group.iterrows():
-            for _ in range(int(row["Total Visits"])):
-                tasks_by_store[row["Store Name"]].append({
-                    "Store": row["Store Name"],
-                    "City": row["City"],
-                    "Duration": float(row["Estimated Duration In a store"]),
-                    "Cluster": int(cluster_id),
-                    "Lat": row.get("Lat", np.nan),
-                    "Long": row.get("Long", np.nan),
-                })
+            total_v = int(row["Total Visits"])
+            if total_v <= 0:
+                continue
+
+            is_month = (str(row.get("_FreqPeriod", "week")).lower() == "month")
+
+            if is_month:
+                # 1) spread across weeks
+                week_seq = spread_weeks_evenly(total_v, weeks)  # list of week ids
+                # 2) within each week, spread across days
+                # count visits per week
+                from collections import Counter
+                cnt = Counter(week_seq)
+                # for deterministic order, go round-robin by week appearance
+                # and for each week, assign day names evenly
+                per_week_day_iters = {
+                    wk: iter(spread_days_evenly(cnt[wk])) for wk in sorted(cnt.keys())
+                }
+                for wk in week_seq:
+                    pref_dow = next(per_week_day_iters[wk], None)
+                    pref_day = f"Week{wk}-{pref_dow}" if pref_dow else None
+                    tasks_by_store[row["Store Name"]].append({
+                        "Store": row["Store Name"],
+                        "City": row["City"],
+                        "Duration": float(row["Estimated Duration In a store"]),
+                        "Cluster": int(cluster_id),
+                        "Lat": row.get("Lat", np.nan),
+                        "Long": row.get("Long", np.nan),
+                        "PreferredWeek": wk,
+                        "PreferredDay": pref_day,  # exact WeekX-Day if possible
+                    })
+            else:
+                # weekly rows: no preference, previous behavior
+                for _ in range(total_v):
+                    tasks_by_store[row["Store Name"]].append({
+                        "Store": row["Store Name"],
+                        "City": row["City"],
+                        "Duration": float(row["Estimated Duration In a store"]),
+                        "Cluster": int(cluster_id),
+                        "Lat": row.get("Lat", np.nan),
+                        "Long": row.get("Long", np.nan),
+                        "PreferredWeek": None,
+                        "PreferredDay": None,
+                    })
 
         merch_schedules: dict[str, dict] = {}
         store_merch_map: dict[str, str] = {}
         merch_id = 1
 
         for store, visits in tasks_by_store.items():
-            start_idx = hash(store) % day_count  # deterministic within one process
+            # deterministic but stable across runs if store names unchanged
+            start_idx_all = hash(store) % max(1, day_count)
 
             preferred_merch = store_merch_map.get(store) if strict_same_merch else None
             merch_pool = [preferred_merch] if (preferred_merch and preferred_merch in merch_schedules) else \
@@ -212,47 +294,78 @@ def schedule_with_constraints(
                         merch_id += 1
                     cal = merch_schedules[merch]
 
-                    for offset in range(day_count):
-                        day = days[(start_idx + offset) % day_count]
+                    # ---- Candidate day lists (most specific first) ----
+                    candidate_days_ordered = []
 
-                        # same store twice/day guard
-                        if any(v["Store"] == store for v in cal[day]["visits"]):
-                            continue
+                    # A) exact preferred day (WeekX-DOW) if provided
+                    pd_exact = visit.get("PreferredDay")
+                    if pd_exact and pd_exact in cal:
+                        candidate_days_ordered.append([pd_exact])
 
-                        # distance guard across the day's visits
-                        if max_km_same_day and cal[day]["visits"]:
-                            too_far = False
-                            for v in cal[day]["visits"]:
-                                if all(pd.notna([v["Lat"], v["Long"], visit["Lat"], visit["Long"]])):
-                                    if dist_km(v["Lat"], v["Long"], visit["Lat"], visit["Long"], model=distance_model) > max_km_same_day:
-                                        too_far = True; break
-                            if too_far: continue
+                    # B) same week, any day (rotating start inside that week)
+                    pw = visit.get("PreferredWeek")
+                    if pw:
+                        wk_days = days_for_week(pw)
+                        if wk_days:
+                            start_idx_local = hash(store) % len(wk_days)
+                            candidate_days_ordered.append([wk_days[(start_idx_local + k) % len(wk_days)] for k in range(len(wk_days))])
 
-                        # travel minutes: from last stop (first stop = 0) unless default_travel
-                        if default_travel is not None:
-                            travel_min = float(default_travel)
-                        else:
-                            if cal[day]["visits"] and all(pd.notna([cal[day]["visits"][-1]["Lat"], cal[day]["visits"][-1]["Long"], visit["Lat"], visit["Long"]])):
-                                km = dist_km(cal[day]["visits"][-1]["Lat"], cal[day]["visits"][-1]["Long"],
-                                             visit["Lat"], visit["Long"], model=distance_model)
-                                travel_min = (km / avg_speed_kmph) * 60.0
+                    # C) global fallback: all days rotating
+                    candidate_days_ordered.append([days[(start_idx_all + k) % day_count] for k in range(day_count)])
+
+                    # ---- try to place on each candidate list ----
+                    placed_now = False
+
+                    def try_place_on(day_list):
+                        for day in day_list:
+                            # same store twice/day guard
+                            if any(v["Store"] == store for v in cal[day]["visits"]):
+                                continue
+
+                            # distance guard across the day's visits
+                            if max_km_same_day and cal[day]["visits"]:
+                                too_far = False
+                                for v in cal[day]["visits"]:
+                                    if all(pd.notna([v["Lat"], v["Long"], visit["Lat"], visit["Long"]])):
+                                        if dist_km(v["Lat"], v["Long"], visit["Lat"], visit["Long"], model=distance_model) > max_km_same_day:
+                                            too_far = True; break
+                                if too_far:
+                                    continue
+
+                            # travel minutes: from last stop (first stop = 0) unless default_travel
+                            if default_travel is not None:
+                                travel_min = float(default_travel)
                             else:
-                                travel_min = 0.0
+                                if cal[day]["visits"] and all(pd.notna([cal[day]["visits"][-1]["Lat"], cal[day]["visits"][-1]["Long"], visit["Lat"], visit["Long"]])):
+                                    km = dist_km(cal[day]["visits"][-1]["Lat"], cal[day]["visits"][-1]["Long"],
+                                                 visit["Lat"], visit["Long"], model=distance_model)
+                                    travel_min = (km / avg_speed_kmph) * 60.0
+                                else:
+                                    travel_min = 0.0
 
-                        total_time = visit["Duration"] + travel_min
-                        if cal[day]["total"] + total_time <= daily_capacity:
-                            cal[day]["visits"].append({**visit, "ActualTravel": float(travel_min)})
-                            cal[day]["total"] += total_time
+                            total_time = visit["Duration"] + travel_min
+                            if cal[day]["total"] + total_time <= daily_capacity:
+                                cal[day]["visits"].append({**visit, "ActualTravel": float(travel_min)})
+                                cal[day]["total"] += total_time
+                                return True
+                        return False
+
+                    for day_list in candidate_days_ordered:
+                        if try_place_on(day_list):
                             store_merch_map[store] = merch
                             assigned = True
+                            placed_now = True
                             break
-                    if assigned: break
 
+                    if assigned:
+                        break
+
+                # Absolute fallback: create a new merch and place on its lightest day
                 if not assigned:
                     new_merch = f"Merch_{cluster_id}_{merch_id}"; merch_id += 1
                     merch_schedules[new_merch] = {d: {"total": 0.0, "visits": []} for d in days}
-                    first_travel = float(default_travel) if default_travel is not None else 0.0
                     lightest_day = min(days, key=lambda d: merch_schedules[new_merch][d]["total"])
+                    first_travel = float(default_travel) if default_travel is not None else 0.0
                     v = {**visit, "ActualTravel": first_travel}
                     merch_schedules[new_merch][lightest_day]["visits"].append(v)
                     merch_schedules[new_merch][lightest_day]["total"] += visit["Duration"] + first_travel
@@ -449,7 +562,7 @@ def main():
                    help="Round lat/long decimals for haversine cache (higher=more precise, lower=faster)")
     p.add_argument("--verbose", action="store_true")
 
-    # NEW: frequency interpretation controls
+    # frequency interpretation controls
     p.add_argument("--frequency_period",
                    choices=["week", "month"],
                    default="week",
