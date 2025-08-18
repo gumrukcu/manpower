@@ -179,49 +179,63 @@ def schedule_with_constraints(
         eff_period.append(p)
     df["_FreqPeriod"] = eff_period  # "week" or "month"
 
-    # calendar labels
+    # ---- calendar labels ----
     weekdays_all = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
     workdays = max(1, min(int(workdays), 7))
-    day_names = weekdays_all[:workdays]                     # e.g., Mon..Fri
+    day_names = weekdays_all[:workdays]
     days = [f"Week{w+1}-{d}" for w in range(weeks) for d in day_names]
     day_count = len(days)
 
-    # ------------ helpers to spread evenly ------------
-    def spread_weeks_evenly(n_visits: int, weeks_count: int) -> list[int]:
-        """Return week ids (1..weeks_count) distributing n_visits as evenly as possible."""
+    # ------------ helpers (robust even spread) ------------
+    def balanced_week_counts(n_visits: int, weeks_count: int, start_offset: int) -> list[int]:
+        """Return a list of length weeks_count with per-week visit counts, rotated by start_offset."""
         if weeks_count <= 0 or n_visits <= 0:
-            return []
+            return [0] * max(weeks_count, 1)
         base = n_visits // weeks_count
         rem = n_visits % weeks_count
-        # each week gets 'base', first 'rem' weeks get +1
-        buckets = {w: [w] * (base + (1 if w <= rem else 0)) for w in range(1, weeks_count + 1)}
-        # round-robin interleave
-        out = []
-        while any(buckets[w] for w in buckets):
-            for w in range(1, weeks_count + 1):
-                if buckets[w]:
-                    out.append(buckets[w].pop(0))
-        return out
+        counts = [base + (1 if i < rem else 0) for i in range(weeks_count)]
+        # rotate which weeks get the +1 so stores don't all start at Week1
+        start = start_offset % weeks_count
+        return counts[start:] + counts[:start]
 
-    def days_for_week(week_id: int) -> list[str]:
-        prefix = f"Week{int(week_id)}-"
-        return [d for d in days if d.startswith(prefix)]
-
-    def spread_days_evenly(n_visits_week: int) -> list[str]:
-        """Return day-name labels (Mon..Fri etc.) distributed evenly within a week."""
-        if n_visits_week <= 0:
+    def even_day_indices(k: int, m: int, offset: int) -> list[int]:
+        """Pick k indices in range(m) spread across the week; repeats allowed if k>m."""
+        if k <= 0:
             return []
-        base = n_visits_week // len(day_names)
-        rem = n_visits_week % len(day_names)
-        # build buckets for each day of week
-        buckets = {d: [d] * (base + (1 if i < rem else 0)) for i, d in enumerate(day_names)}
+        # simple round-robin across m with rotation
+        order = [(offset + i) % m for i in range(m)]
+        return [order[i % m] for i in range(k)]
+
+    def build_monthly_preferred_days(store_key: str, total_v: int) -> list[str]:
+        """Return a list of preferred exact 'WeekX-DOW' slots, evenly across weeks & days."""
+        if total_v <= 0:
+            return []
+        wk_offset = abs(hash(("wk", store_key))) % max(1, weeks)
+        day_offset = abs(hash(("day", store_key))) % max(1, len(day_names))
+
+        per_week = balanced_week_counts(total_v, weeks, wk_offset)  # length=weeks
+        # produce per-week lists of Day labels
+        per_week_lists = []
+        for w_idx, k in enumerate(per_week):
+            if k <= 0:
+                per_week_lists.append([])
+                continue
+            d_idx = even_day_indices(k, len(day_names), (day_offset + w_idx) % max(1, len(day_names)))
+            per_week_lists.append([f"Week{w_idx+1}-{day_names[i]}" for i in d_idx])
+
+        # interleave across weeks (round-robin) so order is Week1,Week2,…
         out = []
-        while any(buckets[d] for d in buckets):
-            for d in day_names:
-                if buckets[d]:
-                    out.append(buckets[d].pop(0))
+        drained = False
+        step = 0
+        while not drained:
+            drained = True
+            for w_idx in range(weeks):
+                if step < len(per_week_lists[w_idx]):
+                    out.append(per_week_lists[w_idx][step])
+                    drained = False
+            step += 1
         return out
-    # --------------------------------------------------
+    # -------------------------------------------------------
 
     all_schedules = []
     for cluster_id, group in df.groupby("Cluster"):
@@ -233,23 +247,13 @@ def schedule_with_constraints(
             if total_v <= 0:
                 continue
 
+            store_key = f"{row.get('Store Name','')}|{row.get('City','')}"
             is_month = (str(row.get("_FreqPeriod", "week")).lower() == "month")
 
             if is_month:
-                # 1) spread across weeks
-                week_seq = spread_weeks_evenly(total_v, weeks)  # list of week ids
-                # 2) within each week, spread across days
-                # count visits per week
-                from collections import Counter
-                cnt = Counter(week_seq)
-                # for deterministic order, go round-robin by week appearance
-                # and for each week, assign day names evenly
-                per_week_day_iters = {
-                    wk: iter(spread_days_evenly(cnt[wk])) for wk in sorted(cnt.keys())
-                }
-                for wk in week_seq:
-                    pref_dow = next(per_week_day_iters[wk], None)
-                    pref_day = f"Week{wk}-{pref_dow}" if pref_dow else None
+                preferred_days = build_monthly_preferred_days(store_key, total_v)
+                # if weeks is small and constraints later shuffle, we still start from this balanced template
+                for pd_exact in preferred_days:
                     tasks_by_store[row["Store Name"]].append({
                         "Store": row["Store Name"],
                         "City": row["City"],
@@ -257,8 +261,8 @@ def schedule_with_constraints(
                         "Cluster": int(cluster_id),
                         "Lat": row.get("Lat", np.nan),
                         "Long": row.get("Long", np.nan),
-                        "PreferredWeek": wk,
-                        "PreferredDay": pref_day,  # exact WeekX-Day if possible
+                        "PreferredDay": pd_exact,                    # strict target first
+                        "PreferredWeek": int(pd_exact.split('-')[0].replace('Week','')),
                     })
             else:
                 # weekly rows: no preference, previous behavior
@@ -270,8 +274,8 @@ def schedule_with_constraints(
                         "Cluster": int(cluster_id),
                         "Lat": row.get("Lat", np.nan),
                         "Long": row.get("Long", np.nan),
-                        "PreferredWeek": None,
                         "PreferredDay": None,
+                        "PreferredWeek": None,
                     })
 
         merch_schedules: dict[str, dict] = {}
@@ -279,8 +283,7 @@ def schedule_with_constraints(
         merch_id = 1
 
         for store, visits in tasks_by_store.items():
-            # deterministic but stable across runs if store names unchanged
-            start_idx_all = hash(store) % max(1, day_count)
+            start_idx_all = abs(hash(store)) % max(1, day_count)
 
             preferred_merch = store_merch_map.get(store) if strict_same_merch else None
             merch_pool = [preferred_merch] if (preferred_merch and preferred_merch in merch_schedules) else \
@@ -302,20 +305,19 @@ def schedule_with_constraints(
                     if pd_exact and pd_exact in cal:
                         candidate_days_ordered.append([pd_exact])
 
-                    # B) same week, any day (rotating start inside that week)
+                    # B) same week, any day (rotating within the week)
                     pw = visit.get("PreferredWeek")
                     if pw:
-                        wk_days = days_for_week(pw)
+                        wk_prefix = f"Week{int(pw)}-"
+                        wk_days = [d for d in days if d.startswith(wk_prefix)]
                         if wk_days:
-                            start_idx_local = hash(store) % len(wk_days)
+                            start_idx_local = abs(hash(store)) % len(wk_days)
                             candidate_days_ordered.append([wk_days[(start_idx_local + k) % len(wk_days)] for k in range(len(wk_days))])
 
                     # C) global fallback: all days rotating
                     candidate_days_ordered.append([days[(start_idx_all + k) % day_count] for k in range(day_count)])
 
                     # ---- try to place on each candidate list ----
-                    placed_now = False
-
                     def try_place_on(day_list):
                         for day in day_list:
                             # same store twice/day guard
@@ -350,6 +352,7 @@ def schedule_with_constraints(
                                 return True
                         return False
 
+                    placed_now = False
                     for day_list in candidate_days_ordered:
                         if try_place_on(day_list):
                             store_merch_map[store] = merch
@@ -558,8 +561,7 @@ def main():
                    help="Merge merchs with avg daily utilization below this fraction of daily capacity (0 disables merging)")
     p.add_argument("--merge_cross_cluster", action="store_true",
                    help="Allow merging low-utilization merchs across clusters (constraints still enforced)")
-    p.add_argument("--cache_precision", type=int, default=5,
-                   help="Round lat/long decimals for haversine cache (higher=more precise, lower=faster)")
+    p.add_argument("--cache_precision", type=int, default=5)
     p.add_argument("--verbose", action="store_true")
 
     # frequency interpretation controls
