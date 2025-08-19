@@ -71,13 +71,23 @@ def build_cli_args(params: dict) -> list[str]:
         add_flag("--cluster_radius_km", params["cluster_radius_km"])
     add_flag("--distance_model", params["distance_model"])
 
-    # NEW: frequency controls
+    # Frequency controls
     add_flag("--frequency_period", params["frequency_period"])
     add_flag("--month_weeks", params["month_weeks"])
 
+    # Merge controls
     add_flag("--merge_utilization_threshold", params["merge_utilization_threshold"])
     if params["merge_cross_cluster"]:
         args.append("--merge_cross_cluster")
+
+    # NEW: Fixed merch pool
+    if params.get("merch_mode") == "count" and params.get("merch_count"):
+        add_flag("--merch_count", int(params["merch_count"]))
+    elif params.get("merch_mode") == "names" and params.get("merch_names"):
+        add_flag("--merch_names", params["merch_names"])
+    if params.get("fixed_strict_capacity", False):
+        args.append("--fixed_strict_capacity")
+
     add_flag("--cache_precision", params["cache_precision"])
     if params["verbose"]:
         args.append("--verbose")
@@ -312,7 +322,7 @@ else:
             "Upload input Excel", type=["xlsx", "xls"],
             help="Required columns: City, Store Name, Estimated Duration In a store, Frequency. Optional: Lat, Long, Cluster, Frequency Period."
         )
-        st.caption("Tip: Use 'Frequency Period' column (week/month) for per-row overrides. Otherwise choose it below in the UI.")
+        st.caption("Tip: Use a 'Frequency Period' column (week/month) for per-row overrides. Otherwise choose it in the sidebar.")
 
     # Sidebar params
     with st.sidebar:
@@ -337,10 +347,32 @@ else:
 
         st.divider(); st.subheader("Distance & Frequency")
         distance_model = st.selectbox("Distance model", options=["haversine","euclidean"], index=0)
-
-        # NEW: frequency controls (replace old freq_is_total)
         frequency_period = st.selectbox("Interpret 'Frequency' values as", options=["week","month"], index=0)
-        month_weeks = st.number_input("Weeks per month (used if 'month')", min_value=1.0, max_value=6.0, value=4.345, step=0.005, format="%.3f")
+        month_weeks = st.number_input("Weeks per month (used when 'month')", min_value=1.0, max_value=6.0, value=4.345, step=0.005, format="%.3f")
+
+        st.divider(); st.subheader("Merchandisers (optional)")
+        use_fixed_pool = st.checkbox("Use a fixed merch pool (exact count or explicit names)", value=False)
+        merch_mode = None
+        merch_count = None
+        merch_names = None
+        if use_fixed_pool:
+            merch_mode = st.radio("Pool mode", options=["By count","By names"], horizontal=True)
+            if merch_mode == "By count":
+                merch_count = st.number_input("Merchandiser count", min_value=1, max_value=500, value=10, step=1)
+                merch_mode = "count"
+            else:
+                merch_names_text = st.text_area(
+                    "Comma-separated merch names",
+                    placeholder="e.g. TeamA, TeamB, TeamC",
+                    height=80
+                )
+                # normalize commas & whitespace
+                names = [s.strip() for s in (merch_names_text or "").replace("\n", ",").split(",") if s.strip()]
+                merch_names = ",".join(names) if names else ""
+                merch_mode = "names"
+            fixed_strict_capacity = st.checkbox("Never exceed daily capacity (skip extra visits)", value=False)
+        else:
+            fixed_strict_capacity = False
 
         st.divider(); st.subheader("Merge underutilized")
         merge_utilization_threshold = st.slider("Utilization threshold (0 disables)", 0.0, 1.0, 0.0, 0.05)
@@ -369,8 +401,11 @@ else:
                 max_km_same_day=max_km_same_day, strict_same_merch=strict_same_merch,
                 clusters=clusters.strip(), cluster_mode=cluster_mode, cluster_radius_km=cluster_radius_km.strip(),
                 distance_model=distance_model,
-                # NEW:
                 frequency_period=frequency_period, month_weeks=month_weeks,
+                # Fixed merch pool
+                merch_mode=merch_mode, merch_count=merch_count, merch_names=merch_names,
+                fixed_strict_capacity=fixed_strict_capacity,
+                # Merge & misc
                 merge_utilization_threshold=merge_utilization_threshold, merge_cross_cluster=merge_cross_cluster,
                 cache_precision=cache_precision, verbose=verbose,
             )
