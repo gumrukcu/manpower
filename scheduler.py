@@ -2,15 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-Merchandiser scheduler — performance-optimized edition (v2)
-- Deterministic placement (stable hash)
-- O(1) day checks with pre-computed day state
-- Optional fast heuristics and adjacency-only distance scope
-- Vectorized hop-km computation
-- Unscheduled reporting when --fixed_strict_capacity
-- Effort-based merchandiser counts + NEW peak-day concurrency headcount
-- Minor bugfix in merge helper (store+city check)
+Merchandiser scheduler — strict stickiness, zero over-capacity (auto-expand crews)
+
+What’s new vs prior version:
+- "Same store → same merch" is upheld **without** exceeding daily capacity.
+- If a store cannot fit on its current merch within capacity, we **move that store** to
+  another merch (or **spawn a new merch**) so all its visits fit. No over-cap days.
+- Only unschedules when a **single visit duration > daily_capacity**.
+- Keeps performance knobs: --fast (prefer lighter days), --distance_scope {all_day,adjacent}.
+- Effort-based merch math + peak-day concurrency summary.
+- Vectorized hop-km, deterministic spacing, DBSCAN/KMeans clustering.
 """
+
+from __future__ import annotations
 
 import argparse
 import logging
@@ -47,7 +51,6 @@ except ImportError:
 
 @lru_cache(maxsize=None)
 def cached_distance(lat1, lon1, lat2, lon2) -> float:
-    """Geodesic distance in km (cached)."""
     return geodesic((float(lat1), float(lon1)), (float(lat2), float(lon2))).km
 
 
@@ -60,8 +63,7 @@ def _haversine_km(lat1, lon1, lat2, lon2) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 
-# cache precision for haversine
-CACHED_PREC = 5  # ~1.1 m at equator per 5 decimals
+CACHED_PREC = 5
 
 
 def _set_cache_precision(n: int):
@@ -83,14 +85,12 @@ def cached_haversine(lat1, lon1, lat2, lon2) -> float:
 
 
 def _stable_id(s: str) -> int:
-    """32-bit deterministic integer from string."""
     return int(md5(s.encode("utf-8")).hexdigest()[:8], 16)
 
 
 def dist_km(lat1, lon1, lat2, lon2, model: str) -> float:
     if model == "haversine":
         return cached_haversine(lat1, lon1, lat2, lon2)
-    # "geodesic" and legacy "euclidean" alias
     return cached_distance(lat1, lon1, lat2, lon2)
 
 
@@ -109,15 +109,7 @@ def load_and_prepare_data(
 ) -> pd.DataFrame:
     df = pd.read_excel(file_path)
 
-    # normalize numerics
-    for col in [
-        "Lat",
-        "Long",
-        "Estimated Duration In a store",
-        "Estimated Travel Time",
-        "Frequency",
-        "Cluster",
-    ]:
+    for col in ["Lat", "Long", "Estimated Duration In a store", "Estimated Travel Time", "Frequency", "Cluster"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -128,7 +120,6 @@ def load_and_prepare_data(
 
     df = df.dropna(subset=["Estimated Duration In a store", "Frequency"]).copy()
 
-    # Respect existing clusters if present
     if "Cluster" in df.columns and df["Cluster"].notna().any():
         df["Cluster"] = df["Cluster"].fillna(0).astype(int)
         logging.info("ℹ️ Using existing Cluster column from input.")
@@ -147,7 +138,7 @@ def load_and_prepare_data(
             raise ValueError("--cluster_radius_km must be > 0 for cluster_mode=radius")
         coords_deg = gps_df[["Lat", "Long"]].to_numpy(dtype=float)
         coords_rad = np.radians(coords_deg)
-        eps_rad = float(cluster_radius_km) / 6371.0088  # km -> radians
+        eps_rad = float(cluster_radius_km) / 6371.0088
         db = DBSCAN(eps=eps_rad, min_samples=1, metric="haversine", algorithm="ball_tree")
         labels = db.fit_predict(coords_rad)
         gps_df["Cluster"] = labels
@@ -160,9 +151,7 @@ def load_and_prepare_data(
         unique_coords = gps_df.drop_duplicates(subset=["Lat", "Long"])
         k = max(1, min(k, len(unique_coords)))
         logging.info(f"📦 K-Means clustering with k={k}")
-        gps_df["Cluster"] = (
-            KMeans(n_clusters=k, random_state=seed, n_init=10).fit_predict(gps_df[["Lat", "Long"]])
-        )
+        gps_df["Cluster"] = KMeans(n_clusters=k, random_state=seed, n_init=10).fit_predict(gps_df[["Lat", "Long"]])
 
     if not missing_df.empty:
         gps_df["_CityNorm"] = gps_df["City"].astype(str).str.strip().str.upper()
@@ -178,7 +167,7 @@ def load_and_prepare_data(
 
 
 # =========================
-# Scheduler
+# Scheduler (store-level planning)
 # =========================
 
 def schedule_with_constraints(
@@ -194,22 +183,17 @@ def schedule_with_constraints(
     distance_model: str,
     frequency_period: str,
     month_weeks: float,
-    # NEW: fixed merch pool
     fixed_merch_names: Optional[List[str]] = None,
     fixed_strict_capacity: bool = False,
-    # Performance knobs
-    distance_scope: str = "all_day",   # "all_day" | "adjacent"
+    distance_scope: str = "all_day",
     fast: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df = full_df.copy()
 
-    # ---- visits to plan (weekly/monthly logic) ----
+    # ---- visits to plan ----
     base_freq = pd.to_numeric(df["Frequency"], errors="coerce").fillna(0.0)
-
     if "Frequency Period" in df.columns:
-        row_period = (
-            df["Frequency Period"].astype(str).str.strip().str.lower().where(lambda s: s.isin(["week", "month"]))
-        )
+        row_period = df["Frequency Period"].astype(str).str.strip().str.lower().where(lambda s: s.isin(["week", "month"]))
     else:
         row_period = pd.Series([None] * len(df))
 
@@ -226,9 +210,8 @@ def schedule_with_constraints(
     for i in range(len(df)):
         p = row_period.iat[i] if row_period.iat[i] in ("week", "month") else frequency_period
         eff_period.append(p)
-    df["_FreqPeriod"] = eff_period  # "week" or "month"
+    df["_FreqPeriod"] = eff_period
 
-    # ---- calendar labels ----
     weekdays_all = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     workdays = max(1, min(int(workdays), 7))
     day_names = weekdays_all[:workdays]
@@ -240,7 +223,6 @@ def schedule_with_constraints(
             pd.DataFrame(columns=["Store", "City", "Cluster", "Reason", "Duration", "Lat", "Long"]),
         )
 
-    # ==== EVEN SPACING (monthly) ====
     day_to_index = {d: i for i, d in enumerate(days)}
 
     def week_of(day_label: str) -> int:
@@ -270,11 +252,10 @@ def schedule_with_constraints(
                     continue
                 j = target_idx + (d if sgn == 1 else (-d if sgn == -1 else 0))
                 if 0 <= j < total and j not in used:
-                    order.append(j)
-                    used.add(j)
+                    order.append(j); used.add(j)
         return order
 
-    # ==== merch pool (global) ====
+    # ---- calendars ----
     fixed_mode = bool(fixed_merch_names)
     if fixed_mode:
         merch_schedules: Dict[str, Dict[str, Dict[str, Any]]] = {
@@ -283,16 +264,83 @@ def schedule_with_constraints(
         }
     else:
         merch_schedules = {}
+
     store_merch_map: Dict[str, str] = {}
-
-    # global trackers for monthly spacing
-    store_assigned_idx: Dict[str, List[int]] = defaultdict(list)
-    store_week_counts: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
-
-    # unscheduled collector
     unscheduled: List[Dict[str, Any]] = []
 
-    # ---- build per-cluster tasks, but place on the GLOBAL merch pool ----
+    # planner helpers (works on a single merch calendar and returns a plan)
+    def _try_place_store_on_merch(
+        merch: str, visits: List[Dict[str, Any]], *, cal: Dict[str, Any], skey: str,
+        base_rot_seed: int, max_km_same_day: float, distance_model: str,
+        avg_speed_kmph: float, default_travel: Optional[float], daily_capacity: float,
+        distance_scope: str, fast: bool
+    ) -> Optional[List[Tuple[str, float]]]:
+        # shadow copy of per-day state (to test feasibility without committing)
+        shadow = {d: {"total": float(cal[d]["total"]),
+                      "last_lat": cal[d]["last_lat"],
+                      "last_lon": cal[d]["last_lon"],
+                      "stores": set(cal[d]["stores"])} for d in days}
+
+        def _can(day_label: str, v: Dict[str, Any]) -> Tuple[bool, float]:
+            slot = shadow[day_label]
+            # avoid same store twice in a day
+            if (v["Store"], v["City"]) in cal[day_label]["stores"]:
+                return (False, 0.0)
+            # distance guard
+            if max_km_same_day and cal[day_label]["visits"]:
+                if pd.notna(v["Lat"]) and pd.notna(v["Long"]):
+                    if distance_scope == "adjacent":
+                        if slot["last_lat"] is not None and slot["last_lon"] is not None:
+                            if dist_km(slot["last_lat"], slot["last_lon"], v["Lat"], v["Long"], model=distance_model) > max_km_same_day:
+                                return (False, 0.0)
+                    else:
+                        for x in cal[day_label]["visits"]:
+                            if all(pd.notna([x["Lat"], x["Long"], v["Lat"], v["Long"]])):
+                                if dist_km(x["Lat"], x["Long"], v["Lat"], v["Long"], model=distance_model) > max_km_same_day:
+                                    return (False, 0.0)
+            # travel time
+            if default_travel is not None:
+                tmin = float(default_travel)
+            else:
+                if slot["last_lat"] is not None and slot["last_lon"] is not None and pd.notna(v["Lat"]) and pd.notna(v["Long"]):
+                    km = dist_km(slot["last_lat"], slot["last_lon"], v["Lat"], v["Long"], model=distance_model)
+                    tmin = (km / avg_speed_kmph) * 60.0
+                else:
+                    tmin = 0.0
+            # capacity
+            if slot["total"] + v["Duration"] + tmin > daily_capacity:
+                return (False, tmin)
+            return (True, tmin)
+
+        placements: List[Tuple[str, float]] = []
+        base_rot = base_rot_seed
+        for v in visits:
+            cand_lists = []
+            if v.get("PreferredDaysOrdered"):
+                cand_lists.append(v["PreferredDaysOrdered"])  # month targets first
+            cand_lists.append([days[(base_rot + k) % L] for k in range(L)])  # rotation fallback
+
+            placed = False
+            for lst in cand_lists:
+                ordered = sorted(lst, key=lambda d: shadow[d]["total"]) if fast else lst
+                for dlab in ordered:
+                    ok, tmin = _can(dlab, v)
+                    if ok:
+                        # update shadow
+                        slot = shadow[dlab]
+                        slot["total"] += v["Duration"] + tmin
+                        if pd.notna(v["Lat"]) and pd.notna(v["Long"]):
+                            slot["last_lat"], slot["last_lon"] = float(v["Lat"]), float(v["Long"])
+                        placements.append((dlab, tmin))
+                        placed = True
+                        break
+                if placed:
+                    break
+            if not placed:
+                return None
+        return placements
+
+    # build tasks per cluster → per store
     for cluster_id, group in df.groupby("Cluster"):
         tasks_by_store: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
 
@@ -300,7 +348,6 @@ def schedule_with_constraints(
             total_v = int(row["Total Visits"]) if pd.notna(row["Total Visits"]) else 0
             if total_v <= 0:
                 continue
-
             store_name = row.get("Store Name", "")
             city_name = row.get("City", "")
             store_key = f"{store_name}|{city_name}"
@@ -311,259 +358,86 @@ def schedule_with_constraints(
                 for t in targets:
                     ordered_idx = indices_by_closeness(t, L)
                     ordered_days = [days[i] for i in ordered_idx]
-                    tasks_by_store[(store_name, city_name)].append(
-                        {
-                            "Store": store_name,
-                            "City": city_name,
-                            "Cluster": int(cluster_id),
-                            "Duration": float(row["Estimated Duration In a store"]),
-                            "Lat": row.get("Lat", np.nan),
-                            "Long": row.get("Long", np.nan),
-                            "PreferredDaysOrdered": ordered_days,
-                            "Monthly": True,
-                            "TotalV": total_v,
-                        }
-                    )
+                    tasks_by_store[(store_name, city_name)].append({
+                        "Store": store_name, "City": city_name, "Cluster": int(cluster_id),
+                        "Duration": float(row["Estimated Duration In a store"]),
+                        "Lat": row.get("Lat", np.nan), "Long": row.get("Long", np.nan),
+                        "PreferredDaysOrdered": ordered_days, "Monthly": True, "TotalV": total_v,
+                    })
             else:
                 for _ in range(total_v):
-                    tasks_by_store[(store_name, city_name)].append(
-                        {
-                            "Store": store_name,
-                            "City": city_name,
-                            "Cluster": int(cluster_id),
-                            "Duration": float(row["Estimated Duration In a store"]),
-                            "Lat": row.get("Lat", np.nan),
-                            "Long": row.get("Long", np.nan),
-                            "PreferredDaysOrdered": None,
-                            "Monthly": False,
-                            "TotalV": total_v,
-                        }
-                    )
-
-        merch_id_counter = 1  # only used if not fixed_mode
+                    tasks_by_store[(store_name, city_name)].append({
+                        "Store": store_name, "City": city_name, "Cluster": int(cluster_id),
+                        "Duration": float(row["Estimated Duration In a store"]),
+                        "Lat": row.get("Lat", np.nan), "Long": row.get("Long", np.nan),
+                        "PreferredDaysOrdered": None, "Monthly": False, "TotalV": total_v,
+                    })
 
         for (store, city), visits in tasks_by_store.items():
             skey = f"{store}|{city}"
             base_rot = _stable_id(skey) % L
 
-            preferred_merch = store_merch_map.get(skey) if strict_same_merch else None
+            # candidate merch pool
             if fixed_mode:
-                merch_pool = ([preferred_merch] if preferred_merch in (fixed_merch_names or []) else fixed_merch_names)
+                merch_pool = list(merch_schedules.keys())  # must use from pool
             else:
-                merch_pool = (
-                    [preferred_merch]
-                    if (preferred_merch and preferred_merch in merch_schedules)
-                    else list(merch_schedules.keys()) + [f"Merch_{merch_id_counter}"]
+                merch_pool = list(merch_schedules.keys())  # any existing
+
+            best_choice: Optional[Tuple[str, List[Tuple[str, float]], float]] = None  # (merch, plan, added_total)
+
+            for merch in merch_pool:
+                cal = merch_schedules[merch]
+                plan = _try_place_store_on_merch(
+                    merch, visits, cal=cal, skey=skey, base_rot_seed=base_rot,
+                    max_km_same_day=max_km_same_day, distance_model=distance_model,
+                    avg_speed_kmph=avg_speed_kmph, default_travel=default_travel,
+                    daily_capacity=daily_capacity, distance_scope=distance_scope, fast=fast,
                 )
+                if plan is not None:
+                    added = 0.0
+                    for (dlab, tmin), v in zip(plan, visits):
+                        added += cal[dlab]["total"] + v["Duration"] + tmin  # simple score
+                    if (best_choice is None) or (added < best_choice[2]):
+                        best_choice = (merch, plan, added)
 
-            # spacing caps for this store (monthly)
-            total_v_for_store = len(visits)
-            max_per_week_cap = math.ceil(total_v_for_store / max(1, weeks))
-            min_gap_slots = max(1, L // max(1, total_v_for_store))
+            # if none fits, spawn a new merch (unless fixed pool)
+            if best_choice is None and not fixed_mode:
+                new_merch = f"Merch_{len(merch_schedules) + 1}"
+                merch_schedules[new_merch] = {d: {"total": 0.0, "visits": [], "stores": set(), "last_lat": None, "last_lon": None} for d in days}
+                cal = merch_schedules[new_merch]
+                plan = _try_place_store_on_merch(
+                    new_merch, visits, cal=cal, skey=skey, base_rot_seed=base_rot,
+                    max_km_same_day=max_km_same_day, distance_model=distance_model,
+                    avg_speed_kmph=avg_speed_kmph, default_travel=default_travel,
+                    daily_capacity=daily_capacity, distance_scope=distance_scope, fast=fast,
+                )
+                if plan is not None:
+                    added = sum(cal[dlab]["total"] + v["Duration"] + tmin for (dlab, tmin), v in zip(plan, visits))
+                    best_choice = (new_merch, plan, added)
 
-            for visit in visits:
-                assigned = False
+            # still none? ⇒ only impossible if a single visit > capacity
+            if best_choice is None:
+                for v in visits:
+                    if float(v["Duration"]) > float(daily_capacity):
+                        unscheduled.append({
+                            "Store": v["Store"], "City": v["City"], "Cluster": v["Cluster"],
+                            "Reason": "visit duration > daily_capacity", "Duration": float(v["Duration"]),
+                            "Lat": v.get("Lat", np.nan), "Long": v.get("Long", np.nan),
+                        })
+                continue
 
-                for merch in merch_pool:
-                    # materialize merch if on-demand mode
-                    if merch not in merch_schedules:
-                        # only allowed in non-fixed mode
-                        merch_schedules[merch] = {
-                            d: {"total": 0.0, "visits": [], "stores": set(), "last_lat": None, "last_lon": None}
-                            for d in days
-                        }
-                        merch_id_counter += 1
-                    cal = merch_schedules[merch]
-
-                    # candidate day lists (preference then global rotation)
-                    candidate_day_lists = []
-                    if visit.get("PreferredDaysOrdered"):
-                        candidate_day_lists.append(visit["PreferredDaysOrdered"])
-                    candidate_day_lists.append([days[(base_rot + k) % L] for k in range(L)])
-
-                    # placement helpers with toggles
-                    def can_place(
-                        day_label: str, *, enforce_gap=True, enforce_wcap=True, enforce_dist=True, enforce_cap=True
-                    ) -> Tuple[bool, float]:
-                        slot = cal[day_label]
-                        # same store / day guard (O(1))
-                        if (store, city) in slot["stores"]:
-                            return (False, 0.0)
-
-                        # monthly spacing
-                        if visit["Monthly"]:
-                            if enforce_wcap:
-                                wk = week_of(day_label)
-                                if store_week_counts[skey][wk] >= max_per_week_cap:
-                                    return (False, 0.0)
-                            if enforce_gap and store_assigned_idx[skey]:
-                                idx = day_to_index[day_label]
-                                if min(abs(idx - j) for j in store_assigned_idx[skey]) < min_gap_slots:
-                                    return (False, 0.0)
-
-                        # distance guard
-                        if enforce_dist and max_km_same_day and slot["visits"] and pd.notna(visit["Lat"]) and pd.notna(
-                            visit["Long"]
-                        ):
-                            if distance_scope == "adjacent":
-                                if slot["last_lat"] is not None and slot["last_lon"] is not None:
-                                    if (
-                                        dist_km(slot["last_lat"], slot["last_lon"], visit["Lat"], visit["Long"], model=distance_model)
-                                        > max_km_same_day
-                                    ):
-                                        return (False, 0.0)
-                            else:  # all_day
-                                for v in slot["visits"]:
-                                    if all(pd.notna([v["Lat"], v["Long"], visit["Lat"], visit["Long"]])):
-                                        if dist_km(v["Lat"], v["Long"], visit["Lat"], visit["Long"], model=distance_model) > max_km_same_day:
-                                            return (False, 0.0)
-
-                        # travel time
-                        if default_travel is not None:
-                            travel_min = float(default_travel)
-                        else:
-                            if slot["visits"] and all(
-                                pd.notna([slot["last_lat"], slot["last_lon"], visit["Lat"], visit["Long"]])
-                            ):
-                                km = dist_km(slot["last_lat"], slot["last_lon"], visit["Lat"], visit["Long"], model=distance_model)
-                                travel_min = (km / avg_speed_kmph) * 60.0
-                            else:
-                                travel_min = 0.0
-
-                        total_time = visit["Duration"] + travel_min
-                        if enforce_cap and (slot["total"] + total_time > daily_capacity):
-                            return (False, travel_min)
-                        return (True, travel_min)
-
-                    def place(day_label: str, travel_min: float, overcap_flag: int):
-                        v = {**visit, "ActualTravel": float(travel_min), "OverCapacity": overcap_flag}
-                        slot = cal[day_label]
-                        slot["visits"].append(v)
-                        slot["total"] += visit["Duration"] + float(travel_min)
-                        slot["stores"].add((store, city))
-                        if pd.notna(visit["Lat"]) and pd.notna(visit["Long"]):
-                            slot["last_lat"], slot["last_lon"] = float(visit["Lat"]), float(visit["Long"])
-                        store_merch_map[skey] = merch
-                        if visit["Monthly"]:
-                            idx = day_to_index[day_label]
-                            store_assigned_idx[skey].append(idx)
-                            store_week_counts[skey][week_of(day_label)] += 1
-
-                    def sorted_by_load(day_list: List[str]) -> List[str]:
-                        return sorted(day_list, key=lambda d: cal[d]["total"]) if fast else day_list
-
-                    placed = False
-
-                    # 1) strict everything
-                    for lst in candidate_day_lists:
-                        for dlab in sorted_by_load(lst):
-                            if fast and (cal[dlab]["total"] + visit["Duration"] > daily_capacity) and (
-                                default_travel in (0, None)
-                            ):
-                                continue  # quick prune when travel≈0
-                            ok, tmin = can_place(dlab, enforce_gap=True, enforce_wcap=True, enforce_dist=True, enforce_cap=True)
-                            if ok:
-                                place(dlab, tmin, 0)
-                                assigned = True
-                                placed = True
-                                break
-                        if placed:
-                            break
-                    if placed:
-                        break
-
-                    # 2) relax distance, keep capacity
-                    for lst in candidate_day_lists:
-                        for dlab in sorted_by_load(lst):
-                            ok, tmin = can_place(dlab, enforce_gap=True, enforce_wcap=True, enforce_dist=False, enforce_cap=True)
-                            if ok:
-                                place(dlab, tmin, 0)
-                                assigned = True
-                                placed = True
-                                break
-                        if placed:
-                            break
-                    if placed:
-                        break
-
-                    # 3) relax weekly cap (keep gap), keep distance+capacity
-                    for lst in candidate_day_lists:
-                        for dlab in sorted_by_load(lst):
-                            ok, tmin = can_place(dlab, enforce_gap=True, enforce_wcap=False, enforce_dist=True, enforce_cap=True)
-                            if ok:
-                                place(dlab, tmin, 0)
-                                assigned = True
-                                placed = True
-                                break
-                        if placed:
-                            break
-                    if placed:
-                        break
-
-                # 4) FINAL FALLBACKS (fixed_mode only)
-                if not assigned and fixed_mode:
-                    # try best placement by minimal added total; distance relaxed, capacity optional
-                    best = None  # (added_total, merch_name, day_label, travel_min)
-                    for merch in fixed_merch_names or []:
-                        cal = merch_schedules[merch]
-                        for dlab in days:
-                            slot = cal[dlab]
-                            # avoid same store twice a day
-                            if (store, city) in slot["stores"]:
-                                continue
-                            ok, tmin = can_place(dlab, enforce_gap=False, enforce_wcap=False, enforce_dist=False, enforce_cap=not fixed_strict_capacity)
-                            if not ok and fixed_strict_capacity:
-                                continue
-                            added = slot["total"] + visit["Duration"] + (tmin if not math.isnan(tmin) else 0.0)
-                            if (best is None) or (added < best[0]):
-                                best = (added, merch, dlab, tmin)
-
-                    if best is not None:
-                        _, merch, dlab, tmin = best
-                        overcap = 1 if (fixed_strict_capacity is False and (merch_schedules[merch][dlab]["total"] + visit["Duration"] + tmin > daily_capacity)) else 0
-                        slot = merch_schedules[merch][dlab]
-                        v = {**visit, "ActualTravel": float(tmin), "OverCapacity": overcap}
-                        slot["visits"].append(v)
-                        slot["total"] += visit["Duration"] + float(tmin)
-                        slot["stores"].add((store, city))
-                        if pd.notna(visit["Lat"]) and pd.notna(visit["Long"]):
-                            slot["last_lat"], slot["last_lon"] = float(visit["Lat"]), float(visit["Long"])
-                        if visit["Monthly"]:
-                            idx = day_to_index[dlab]
-                            store_assigned_idx[skey].append(idx)
-                            store_week_counts[skey][week_of(dlab)] += 1
-                        assigned = True
-
-                # 5) Not assigned and not fixed_mode → create new merch and place on lightest day
-                if not assigned and not fixed_mode:
-                    new_merch = f"Merch_auto_{len(merch_schedules) + 1}"
-                    merch_schedules[new_merch] = {
-                        d: {"total": 0.0, "visits": [], "stores": set(), "last_lat": None, "last_lon": None} for d in days
-                    }
-                    lightest_day = min(days, key=lambda d: merch_schedules[new_merch][d]["total"])
-                    first_travel = float(default_travel) if default_travel is not None else 0.0
-                    v = {**visit, "ActualTravel": first_travel, "OverCapacity": 0}
-                    slot = merch_schedules[new_merch][lightest_day]
-                    slot["visits"].append(v)
-                    slot["total"] += visit["Duration"] + first_travel
-                    slot["stores"].add((store, city))
-                    if pd.notna(visit["Lat"]) and pd.notna(visit["Long"]):
-                        slot["last_lat"], slot["last_lon"] = float(visit["Lat"]), float(visit["Long"])
-                    store_merch_map[skey] = new_merch
-
-                # 6) Still not assigned? Record as unscheduled (only meaningful when fixed_strict_capacity)
-                if not assigned and fixed_mode and fixed_strict_capacity:
-                    unscheduled.append(
-                        {
-                            "Store": visit["Store"],
-                            "City": visit["City"],
-                            "Cluster": int(cluster_id),
-                            "Reason": "No feasible slot under constraints",
-                            "Duration": float(visit["Duration"]),
-                            "Lat": visit.get("Lat", np.nan),
-                            "Long": visit.get("Long", np.nan),
-                        }
-                    )
+            # commit chosen plan to chosen merch
+            merch, plan, _ = best_choice
+            cal = merch_schedules[merch]
+            for v, (day_label, tmin) in zip(visits, plan):
+                rec = {**v, "ActualTravel": float(tmin), "OverCapacity": 0}
+                slot = cal[day_label]
+                slot["visits"].append(rec)
+                slot["total"] += v["Duration"] + float(tmin)
+                slot["stores"].add((store, city))
+                if pd.notna(v["Lat"]) and pd.notna(v["Long"]):
+                    slot["last_lat"], slot["last_lon"] = float(v["Lat"]), float(v["Long"])
+            store_merch_map[skey] = merch
 
     # ---- flatten to dataframe ----
     all_rows: List[Dict[str, Any]] = []
@@ -579,21 +453,12 @@ def schedule_with_constraints(
 
 
 # =========================
-# Merge underutilized merchs (kept for non-fixed mode)
+# Merge underutilized (unchanged)
 # =========================
 
-def merge_underutilized(
-    schedule_df: pd.DataFrame,
-    *,
-    daily_capacity: float,
-    max_km_same_day: float,
-    distance_model: str,
-    threshold: float,
-    cross_cluster: bool = False,
-) -> pd.DataFrame:
+def merge_underutilized(schedule_df: pd.DataFrame, *, daily_capacity: float, max_km_same_day: float, distance_model: str, threshold: float, cross_cluster: bool = False) -> pd.DataFrame:
     if threshold <= 0:
         return schedule_df
-
     df = schedule_df.copy().reset_index(drop=True)
     df["_VisitMin"] = df["Duration"].astype(float) + pd.to_numeric(df.get("ActualTravel", 0.0), errors="coerce").fillna(0.0)
 
@@ -605,7 +470,6 @@ def merge_underutilized(
         if day_load(target_merch, target_day) + float(row["_VisitMin"]) > daily_capacity:
             return False
         sel = (df["Merchandiser"] == target_merch) & (df["Day"] == target_day)
-        # FIX: same store + same city check must be row-wise (AND), not two independent ANYs
         same_store_same_city = ((df.loc[sel, "Store"] == row["Store"]) & (df.loc[sel, "City"] == row["City"]))
         if same_store_same_city.any():
             return False
@@ -630,36 +494,27 @@ def merge_underutilized(
         improved = True
         while improved:
             improved = False
-
-            daily = (
-                df.loc[c_mask].groupby(["Merchandiser", "Day"], as_index=False)["_VisitMin"].sum().rename(columns={"_VisitMin": "DailyMin"})
-            )
+            daily = df.loc[c_mask].groupby(["Merchandiser", "Day"], as_index=False)["_VisitMin"].sum().rename(columns={"_VisitMin": "DailyMin"})
             if daily.empty:
                 continue
             util = (daily.groupby("Merchandiser")["DailyMin"].mean() / daily_capacity).sort_values()
-
             order = util.index.tolist()
             order.sort(key=lambda m: (len(df.loc[c_mask & (df["Merchandiser"] == m)]), util.get(m, 1.0)))
-
             for low_merch in order:
                 if util.get(low_merch, 1.0) >= threshold:
                     continue
                 low_rows = df.loc[c_mask & (df["Merchandiser"] == low_merch)]
                 if low_rows.empty:
                     continue
-
                 candidates_mask = c_mask & (df["Merchandiser"] != low_merch)
                 targets = df.loc[candidates_mask, "Merchandiser"].drop_duplicates().tolist()
                 moved_any = False
-
                 for idx in low_rows.index.tolist():
                     row = df.loc[idx]
                     placed = False
                     for tgt in targets:
                         cand_days = df.loc[(df["Merchandiser"] == tgt) & c_mask, "Day"].drop_duplicates().tolist()
-                        cand_days.sort(
-                            key=lambda d: float(df.loc[(df["Merchandiser"] == tgt) & (df["Day"] == d), "_VisitMin"].sum())
-                        )
+                        cand_days.sort(key=lambda d: float(df.loc[(df["Merchandiser"] == tgt) & (df["Day"] == d), "_VisitMin"].sum()))
                         for tgt_day in cand_days:
                             if ok_same_day(tgt, tgt_day, row):
                                 df.at[idx, "Merchandiser"] = tgt
@@ -681,7 +536,7 @@ def merge_underutilized(
 
 
 # =========================
-# Travel km per day & weekly totals (vectorized)
+# Travel km per day & weekly totals
 # =========================
 
 def compute_day_km(sched_df: pd.DataFrame, *, distance_model: str):
@@ -704,9 +559,7 @@ def compute_day_km(sched_df: pd.DataFrame, *, distance_model: str):
         else:
             idx = df.index[mask]
             for i in idx:
-                df.at[i, "HopKM"] = dist_km(
-                    df.at[i, "PrevLat"], df.at[i, "PrevLon"], df.at[i, "Lat"], df.at[i, "Long"], model=distance_model
-                )
+                df.at[i, "HopKM"] = dist_km(df.at[i, "PrevLat"], df.at[i, "PrevLon"], df.at[i, "Lat"], df.at[i, "Long"], model=distance_model)
     day_km = df.groupby(["Merchandiser", "Day"], as_index=False)["HopKM"].sum().rename(columns={"HopKM": "DayKM"})
     merch_km = day_km.groupby("Merchandiser", as_index=False)["DayKM"].sum().rename(columns={"DayKM": "TotalKM"})
     return df.drop(columns=["PrevLat", "PrevLon"]), day_km, merch_km
@@ -720,9 +573,7 @@ def compute_expected_total_visits(src_df: pd.DataFrame, weeks: int, frequency_pe
     df = src_df.copy()
     base = pd.to_numeric(df["Frequency"], errors="coerce").fillna(0.0)
     if "Frequency Period" in df.columns:
-        row_period = (
-            df["Frequency Period"].astype(str).str.strip().str.lower().where(lambda s: s.isin(["week", "month"]))
-        )
+        row_period = df["Frequency Period"].astype(str).str.strip().str.lower().where(lambda s: s.isin(["week", "month"]))
     else:
         row_period = pd.Series([None] * len(df))
     mw = float(month_weeks) if month_weeks and month_weeks > 0 else 4.345
@@ -736,31 +587,13 @@ def compute_expected_total_visits(src_df: pd.DataFrame, weeks: int, frequency_pe
     return int(total)
 
 
-def compute_effort_based_merchandisers(
-    sched_df: pd.DataFrame,
-    unsched_df: pd.DataFrame,
-    *,
-    daily_capacity: float,
-    workdays: int,
-    weeks: int,
-    default_travel: Optional[float],
-) -> Tuple[int, int, float, float]:
-    """
-    Returns (needed_scheduled_only, needed_including_unscheduled, scheduled_minutes, total_minutes_incl_unscheduled)
-    """
-    scheduled_minutes = float(
-        (pd.to_numeric(sched_df.get("Duration", 0.0), errors="coerce").fillna(0.0)
-         + pd.to_numeric(sched_df.get("ActualTravel", 0.0), errors="coerce").fillna(0.0)).sum()
-    )
-
-    # Approximate unscheduled travel: if default_travel is given, add it once per unscheduled visit; otherwise 0
+def compute_effort_based_merchandisers(sched_df: pd.DataFrame, unsched_df: pd.DataFrame, *, daily_capacity: float, workdays: int, weeks: int, default_travel: Optional[float]) -> Tuple[int, int, float, float]:
+    scheduled_minutes = float((pd.to_numeric(sched_df.get("Duration", 0.0), errors="coerce").fillna(0.0) + pd.to_numeric(sched_df.get("ActualTravel", 0.0), errors="coerce").fillna(0.0)).sum())
+    unsched_minutes = 0.0
     if unsched_df is not None and not unsched_df.empty:
         unsched_minutes = float(pd.to_numeric(unsched_df.get("Duration", 0.0), errors="coerce").fillna(0.0).sum())
         if default_travel is not None:
             unsched_minutes += float(default_travel) * len(unsched_df)
-    else:
-        unsched_minutes = 0.0
-
     total_minutes = scheduled_minutes + unsched_minutes
     per_merch_capacity = float(daily_capacity) * float(workdays) * float(weeks)
     needed_sched = int(math.ceil(scheduled_minutes / per_merch_capacity)) if per_merch_capacity > 0 else 0
@@ -769,11 +602,6 @@ def compute_effort_based_merchandisers(
 
 
 def compute_peak_day_merch_need(daily_totals: pd.DataFrame, *, daily_capacity: float) -> int:
-    """
-    Peak-day concurrency need ignoring who does the work:
-    For each Day, sum all minutes across merchs, divide by daily capacity, ceil.
-    Return the maximum across days.
-    """
     if daily_totals is None or daily_totals.empty:
         return 0
     per_day_total = daily_totals.groupby("Day", as_index=False)["DailyMinutes"].sum()
@@ -786,78 +614,38 @@ def compute_peak_day_merch_need(daily_totals: pd.DataFrame, *, daily_capacity: f
 # =========================
 
 def main():
-    p = argparse.ArgumentParser(
-        description=(
-            "Merchandiser scheduler with clustering, merge, fixed merch pool, performance knobs, and reporting."
-        )
-    )
+    p = argparse.ArgumentParser(description=("Merchandiser scheduler — strict stickiness, zero over-capacity (auto-expand crews)."))
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--weeks", type=int, default=1)
     p.add_argument("--workdays", type=int, default=5)
     p.add_argument("--daily_capacity", type=float, default=480)
     p.add_argument("--speed", type=float, default=30, help="Avg speed km/h for distance-based travel time")
-    p.add_argument(
-        "--default_travel", type=float, default=None, help="Fixed travel minutes per hop (overrides distance)"
-    )
+    p.add_argument("--default_travel", type=float, default=None, help="Fixed travel minutes per hop (overrides distance)")
     p.add_argument("--max_km_same_day", type=float, default=50)
     p.add_argument("--strict_same_merch", action="store_true")
     p.add_argument("--clusters", type=int, default=None)
     p.add_argument("--cluster_mode", choices=["kmeans", "radius"], default="kmeans")
     p.add_argument("--cluster_radius_km", type=float, default=None)
-    p.add_argument(
-        "--distance_model",
-        choices=["haversine", "geodesic", "euclidean"],
-        default="haversine",
-        help="Distance model: 'haversine' (sphere) or 'geodesic' (ellipsoid). 'euclidean' is an alias for geodesic.",
-    )
+    p.add_argument("--distance_model", choices=["haversine", "geodesic", "euclidean"], default="haversine")
     p.add_argument("--merge_utilization_threshold", type=float, default=0.0)
     p.add_argument("--merge_cross_cluster", action="store_true")
     p.add_argument("--cache_precision", type=int, default=5)
     p.add_argument("--verbose", action="store_true")
-    p.add_argument("--seed", type=int, default=42, help="Random seed for deterministic behavior where applicable")
-
-    # frequency
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--frequency_period", choices=["week", "month"], default="week")
     p.add_argument("--month_weeks", type=float, default=4.345)
-
-    # NEW: fixed merch pool
-    p.add_argument(
-        "--merch_names", type=str, default=None, help="Comma-separated fixed merchandiser names to use (exact)."
-    )
-    p.add_argument(
-        "--merch_count",
-        type=int,
-        default=None,
-        help="Exact number of merchandisers to use (Merch_1..Merch_N) if --merch_names is not given.",
-    )
-    p.add_argument(
-        "--fixed_strict_capacity",
-        action="store_true",
-        help="With fixed merch pool, never exceed daily_capacity; unplaceable visits are reported as UNSCHEDULED.",
-    )
-
-    # Performance knobs
-    p.add_argument(
-        "--distance_scope",
-        choices=["all_day", "adjacent"],
-        default="all_day",
-        help="Scope of max_km_same_day constraint: compare with all prior visits ('all_day') or only the last placed ('adjacent').",
-    )
-    p.add_argument(
-        "--fast",
-        action="store_true",
-        help="Speed-oriented heuristics: sort candidate days by current load and prune obviously over-capacity days.",
-    )
+    p.add_argument("--merch_names", type=str, default=None)
+    p.add_argument("--merch_count", type=int, default=None)
+    p.add_argument("--fixed_strict_capacity", action="store_true", help="(Fixed pool only) never exceed daily_capacity; unplaceable ⇒ Unscheduled")
+    p.add_argument("--distance_scope", choices=["all_day", "adjacent"], default="all_day")
+    p.add_argument("--fast", action="store_true")
 
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(message)s")
     _set_cache_precision(args.cache_precision)
-
-    # Set numpy random seed (for reproducibility of any stochastic operations in libs we use)
     np.random.seed(args.seed)
 
-    # Resolve fixed merch pool
     fixed_names: Optional[List[str]] = None
     if args.merch_names:
         fixed_names = [s.strip() for s in args.merch_names.split(",") if s.strip()]
@@ -866,17 +654,9 @@ def main():
 
     if fixed_names:
         logging.info(f"🔒 Fixed merch pool active: using exactly {len(fixed_names)} merchandisers.")
-        # When fixed pool is active, ignore merge phase later (we must keep the count).
         args.merge_utilization_threshold = 0.0
 
-    df = load_and_prepare_data(
-        args.input,
-        clusters_override=args.clusters,
-        cluster_mode=args.cluster_mode,
-        cluster_radius_km=args.cluster_radius_km,
-        distance_model=args.distance_model,
-        seed=args.seed,
-    )
+    df = load_and_prepare_data(args.input, clusters_override=args.clusters, cluster_mode=args.cluster_mode, cluster_radius_km=args.cluster_radius_km, distance_model=args.distance_model, seed=args.seed)
 
     sched, unsched = schedule_with_constraints(
         df,
@@ -896,7 +676,6 @@ def main():
         fast=args.fast,
     )
 
-    # Optional merge (disabled in fixed mode)
     before = sched["Merchandiser"].nunique() if not sched.empty else 0
     if not fixed_names and args.merge_utilization_threshold > 0:
         sched = merge_underutilized(
@@ -913,97 +692,44 @@ def main():
     elif fixed_names:
         logging.info("↪️ Merge step skipped: fixed merch pool in use.")
 
-    # Expected vs actual
-    expected_total = compute_expected_total_visits(
-        df, weeks=args.weeks, frequency_period=args.frequency_period, month_weeks=args.month_weeks
-    )
+    expected_total = compute_expected_total_visits(df, weeks=args.weeks, frequency_period=args.frequency_period, month_weeks=args.month_weeks)
     actual_total = len(sched)
     print(f"✅ Expected visits: {expected_total}, Scheduled visits: {actual_total}")
     used_merch = sched["Merchandiser"].nunique() if not sched.empty else 0
     print(f"👥 Total merchandisers used: {used_merch}")
     if unsched is not None and not unsched.empty:
-        print(f"🧭 Unscheduled visits (strict capacity): {len(unsched)}")
+        print(f"🧭 Unscheduled visits: {len(unsched)} (see 'Unscheduled' sheet)")
 
-    # ---- reporting: minutes ----
-    sched["PerVisit_Minutes"] = pd.to_numeric(sched["Duration"], errors="coerce").fillna(0.0) + pd.to_numeric(
-        sched.get("ActualTravel", 0.0), errors="coerce"
-    ).fillna(0.0)
+    sched["PerVisit_Minutes"] = pd.to_numeric(sched["Duration"], errors="coerce").fillna(0.0) + pd.to_numeric(sched.get("ActualTravel", 0.0), errors="coerce").fillna(0.0)
 
-    daily_totals = (
-        sched.groupby(["Merchandiser", "Day"], as_index=False)["PerVisit_Minutes"].sum().rename(
-            columns={"PerVisit_Minutes": "DailyMinutes"}
-        )
-    )
-    avg_per_day = (
-        daily_totals.groupby("Merchandiser", as_index=False)["DailyMinutes"].mean().rename(
-            columns={"DailyMinutes": "AvgMinutesPerActiveDay"}
-        )
-    )
-    _week = (
-        pd.to_numeric(sched["Day"].astype(str).str.extract(r"Week(\d+)", expand=False), errors="coerce").fillna(1).astype(int)
-    )
-    weekly_totals = (
-        sched.assign(Week=_week)
-        .groupby(["Merchandiser", "Week"], as_index=False)["PerVisit_Minutes"]
-        .sum()
-        .rename(columns={"PerVisit_Minutes": "WeeklyMinutes"})
-    )
-    avg_per_week = (
-        weekly_totals.groupby("Merchandiser", as_index=False)["WeeklyMinutes"].mean().rename(
-            columns={"WeeklyMinutes": "AvgMinutesPerWeek"}
-        )
-    )
+    daily_totals = sched.groupby(["Merchandiser", "Day"], as_index=False)["PerVisit_Minutes"].sum().rename(columns={"PerVisit_Minutes": "DailyMinutes"})
+    avg_per_day = daily_totals.groupby("Merchandiser", as_index=False)["DailyMinutes"].mean().rename(columns={"DailyMinutes": "AvgMinutesPerActiveDay"})
+    _week = pd.to_numeric(sched["Day"].astype(str).str.extract(r"Week(\d+)", expand=False), errors="coerce").fillna(1).astype(int)
+    weekly_totals = sched.assign(Week=_week).groupby(["Merchandiser", "Week"], as_index=False)["PerVisit_Minutes"].sum().rename(columns={"PerVisit_Minutes": "WeeklyMinutes"})
+    avg_per_week = weekly_totals.groupby("Merchandiser", as_index=False)["WeeklyMinutes"].mean().rename(columns={"WeeklyMinutes": "AvgMinutesPerWeek"})
     workload_summary = pd.merge(avg_per_day, avg_per_week, on="Merchandiser", how="outer").fillna(0.0)
 
     print("\n📊 Average workload per merchandiser:")
     for _, r in workload_summary.sort_values("Merchandiser").iterrows():
-        print(
-            f"- {r['Merchandiser']}: avg/day={int(round(r['AvgMinutesPerActiveDay']))} min, "
-            f"avg/week={int(round(r['AvgMinutesPerWeek']))} min"
-        )
+        print(f"- {r['Merchandiser']}: avg/day={int(round(r['AvgMinutesPerActiveDay']))} min, avg/week={int(round(r['AvgMinutesPerWeek']))} min")
 
-    # ---- kilometers ----
     sched, day_km, merch_km = compute_day_km(sched, distance_model=args.distance_model)
     grand_total_km = float(merch_km["TotalKM"].sum()) if not merch_km.empty else 0.0
-    dist_label = "Total travel distance (all weeks)" if args.weeks > 1 else "Total weekly travel distance"
-    print(f"\n🚗 {dist_label}: {grand_total_km:.1f} km")
+    print(f"\n🚗 Total travel distance: {grand_total_km:.1f} km")
 
-    # ---- Effort-based merchandiser counts ----
-    needed_sched, needed_total, sched_min, total_min = compute_effort_based_merchandisers(
-        sched, unsched, daily_capacity=args.daily_capacity, workdays=args.workdays, weeks=args.weeks, default_travel=args.default_travel
-    )
-    peak_day_need = compute_peak_day_merch_need(
-        daily_totals=daily_totals, daily_capacity=args.daily_capacity
-    )
+    needed_sched, needed_total, sched_min, total_min = compute_effort_based_merchandisers(sched, unsched, daily_capacity=args.daily_capacity, workdays=args.workdays, weeks=args.weeks, default_travel=args.default_travel)
+    peak_day_need = compute_peak_day_merch_need(daily_totals=daily_totals, daily_capacity=args.daily_capacity)
 
-    print(
-        f"\n🧮 Effort-based merchandisers (capacity={args.daily_capacity} min/day × {args.workdays} days × {args.weeks} weeks):"
-    )
-    print(f"   • Global lower bound (scheduled minutes only): {needed_sched}")
+    print(f"\n🧮 Effort-based merchandisers (capacity={args.daily_capacity} min/day × {args.workdays} days × {args.weeks} weeks):")
+    print(f"   • Global lower bound (scheduled only): {needed_sched}")
     if unsched is not None and not unsched.empty:
         print(f"   • Global lower bound (incl. unscheduled): {needed_total}")
     print(f"   • 📈 Peak-day concurrency need: {peak_day_need}")
 
-    # ---- Excel output ----
-    out_cols = [
-        "Cluster",
-        "City",
-        "Store",
-        "Merchandiser",
-        "Day",
-        "Seq",
-        "Duration",
-        "ActualTravel",
-        "PerVisit_Minutes",
-        "Lat",
-        "Long",
-        "HopKM",
-        "OverCapacity",
-    ]
+    out_cols = ["Cluster", "City", "Store", "Merchandiser", "Day", "Seq", "Duration", "ActualTravel", "PerVisit_Minutes", "Lat", "Long", "HopKM", "OverCapacity"]
     existing = [c for c in out_cols if c in sched.columns]
     sched_sorted = sched.sort_values(["Merchandiser", "Day", "Seq"]) if not sched.empty else sched
 
-    # Build effort summary sheet
     effort_rows = [
         {"Metric": "Daily Capacity (min)", "Value": args.daily_capacity},
         {"Metric": "Workdays", "Value": args.workdays},
@@ -1014,27 +740,17 @@ def main():
         {"Metric": "Peak-day Effort Merch (Concurrency)", "Value": peak_day_need},
     ]
     if unsched is not None and not unsched.empty:
-        effort_rows.extend(
-            [
-                {"Metric": "Unscheduled Count", "Value": len(unsched)},
-                {"Metric": "Total Minutes incl. Unscheduled", "Value": total_min},
-                {"Metric": "Effort-based Merch (Global LB, Incl. Unscheduled)", "Value": needed_total},
-            ]
-        )
+        effort_rows.extend([
+            {"Metric": "Unscheduled Count", "Value": len(unsched)},
+            {"Metric": "Total Minutes incl. Unscheduled", "Value": total_min},
+            {"Metric": "Effort-based Merch (Global LB, Incl. Unscheduled)", "Value": needed_total},
+        ])
     effort_df = pd.DataFrame(effort_rows)
 
     try:
         with pd.ExcelWriter(args.output, engine="xlsxwriter") as xw:
-            if not sched_sorted.empty:
-                sched_sorted[existing].to_excel(xw, index=False, sheet_name="Schedule")
-            else:
-                pd.DataFrame(columns=existing).to_excel(xw, index=False, sheet_name="Schedule")
-
-            (
-                daily_totals.assign(UtilizationPct=(daily_totals["DailyMinutes"] / float(args.daily_capacity)) * 100.0)
-                .sort_values(["Merchandiser", "Day"])
-                .to_excel(xw, index=False, sheet_name="Summary")
-            )
+            (sched_sorted[existing] if not sched_sorted.empty else pd.DataFrame(columns=existing)).to_excel(xw, index=False, sheet_name="Schedule")
+            (daily_totals.assign(UtilizationPct=(daily_totals["DailyMinutes"] / float(args.daily_capacity)) * 100.0).sort_values(["Merchandiser", "Day"])) .to_excel(xw, index=False, sheet_name="Summary")
             day_km.sort_values(["Merchandiser", "Day"]).to_excel(xw, index=False, sheet_name="DailyKM")
             merch_km.sort_values("Merchandiser").to_excel(xw, index=False, sheet_name="Weekly_KM")
             workload_summary.sort_values("Merchandiser").to_excel(xw, index=False, sheet_name="Workload_Averages")
@@ -1043,16 +759,8 @@ def main():
                 unsched.to_excel(xw, index=False, sheet_name="Unscheduled")
     except Exception:
         with pd.ExcelWriter(args.output) as xw:
-            if not sched_sorted.empty:
-                sched_sorted[existing].to_excel(xw, index=False, sheet_name="Schedule")
-            else:
-                pd.DataFrame(columns=existing).to_excel(xw, index=False, sheet_name="Schedule")
-
-            (
-                daily_totals.assign(UtilizationPct=(daily_totals["DailyMinutes"] / float(args.daily_capacity)) * 100.0)
-                .sort_values(["Merchandiser", "Day"])
-                .to_excel(xw, index=False, sheet_name="Summary")
-            )
+            (sched_sorted[existing] if not sched_sorted.empty else pd.DataFrame(columns=existing)).to_excel(xw, index=False, sheet_name="Schedule")
+            (daily_totals.assign(UtilizationPct=(daily_totals["DailyMinutes"] / float(args.daily_capacity)) * 100.0).sort_values(["Merchandiser", "Day"])) .to_excel(xw, index=False, sheet_name="Summary")
             day_km.sort_values(["Merchandiser", "Day"]).to_excel(xw, index=False, sheet_name="DailyKM")
             merch_km.sort_values("Merchandiser").to_excel(xw, index=False, sheet_name="Weekly_KM")
             workload_summary.sort_values("Merchandiser").to_excel(xw, index=False, sheet_name="Workload_Averages")
@@ -1060,11 +768,7 @@ def main():
             if unsched is not None and not unsched.empty:
                 unsched.to_excel(xw, index=False, sheet_name="Unscheduled")
 
-    print(
-        f"\n📄 Schedule saved to {args.output} (sheets: Schedule, Summary, DailyKM, Weekly_KM, Workload_Averages, Effort_Summary"
-        + (", Unscheduled" if unsched is not None and not unsched.empty else "")
-        + ")"
-    )
+    print(f"\n📄 Schedule saved to {args.output} (sheets: Schedule, Summary, DailyKM, Weekly_KM, Workload_Averages, Effort_Summary" + (", Unscheduled" if unsched is not None and not unsched.empty else "") + ")")
 
 
 if __name__ == "__main__":
