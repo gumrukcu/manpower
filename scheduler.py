@@ -320,7 +320,7 @@ def schedule_with_constraints(
                         "Store": store_name, "City": city_name, "Cluster": int(cluster_id),
                         "Duration": float(row["Estimated Duration In a store"]),
                         "Lat": row.get("Lat", np.nan), "Long": row.get("Long", np.nan),
-                        "PreferredDaysOrdered": ordered_days, "Monthly": True, "TotalV": total_v,
+                        "PreferredDaysOrdered": week_days, "Monthly": True, "TotalV": total_v,
                     })
             else:
                 for _ in range(total_v):
