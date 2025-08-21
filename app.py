@@ -12,7 +12,7 @@ from streamlit_folium import st_folium
 # ======================
 # Config & simple styles
 # ======================
-SCRIPT_PATH = os.environ.get("SCHEDULER_SCRIPT", "scheduler.py")  # your updated script
+SCRIPT_PATH = os.environ.get("SCHEDULER_SCRIPT", "scheduler.py")  # your updated script (e.g., merch_scheduler_fast.py)
 DEFAULT_OUTPUT_NAME = "schedule_output.xlsx"
 PAGE_TITLE = "Merchandiser Scheduler"
 PAGE_ICON = "📅"
@@ -70,6 +70,11 @@ def build_cli_args(params: dict) -> list[str]:
     if params["cluster_radius_km"]:
         add_flag("--cluster_radius_km", params["cluster_radius_km"])
     add_flag("--distance_model", params["distance_model"])
+
+    # ➕ NEW: distance scope & fast heuristics
+    add_flag("--distance_scope", params["distance_scope"])  # all_day | adjacent
+    if params.get("fast", False):
+        args.append("--fast")
 
     # Frequency controls
     add_flag("--frequency_period", params["frequency_period"])
@@ -347,6 +352,15 @@ else:
 
         st.divider(); st.subheader("Distance & Frequency")
         distance_model = st.selectbox("Distance model", options=["haversine","euclidean"], index=0)
+        # ➕ NEW controls
+        distance_scope = st.selectbox(
+            "Same-day distance scope",
+            options=["all_day", "adjacent"],
+            index=1,
+            help="'all_day' checks new stops against all prior stops that day; 'adjacent' checks only the last placed stop (faster).",
+        )
+        fast = st.checkbox("Enable fast heuristics", value=True, help="Try lighter days first and prune obviously over-capacity days.")
+
         frequency_period = st.selectbox("Interpret 'Frequency' values as", options=["week","month"], index=0)
         month_weeks = st.number_input("Weeks per month (used when 'month')", min_value=1.0, max_value=6.0, value=4.345, step=0.005, format="%.3f")
 
@@ -366,7 +380,6 @@ else:
                     placeholder="e.g. TeamA, TeamB, TeamC",
                     height=80
                 )
-                # normalize commas & whitespace
                 names = [s.strip() for s in (merch_names_text or "").replace("\n", ",").split(",") if s.strip()]
                 merch_names = ",".join(names) if names else ""
                 merch_mode = "names"
@@ -401,6 +414,9 @@ else:
                 max_km_same_day=max_km_same_day, strict_same_merch=strict_same_merch,
                 clusters=clusters.strip(), cluster_mode=cluster_mode, cluster_radius_km=cluster_radius_km.strip(),
                 distance_model=distance_model,
+                # NEW
+                distance_scope=distance_scope, fast=fast,
+                # Frequency
                 frequency_period=frequency_period, month_weeks=month_weeks,
                 # Fixed merch pool
                 merch_mode=merch_mode, merch_count=merch_count, merch_names=merch_names,
