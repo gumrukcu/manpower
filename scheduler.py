@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Merchandiser scheduler — performance-optimized edition
+Merchandiser scheduler — performance-optimized edition (v2)
 - Deterministic placement (stable hash)
 - O(1) day checks with pre-computed day state
 - Optional fast heuristics and adjacency-only distance scope
 - Vectorized hop-km computation
 - Unscheduled reporting when --fixed_strict_capacity
-- Effort-based merchandiser count at the end + in Excel sheet
+- Effort-based merchandiser counts + NEW peak-day concurrency headcount
+- Minor bugfix in merge helper (store+city check)
 """
 
 import argparse
@@ -604,7 +605,9 @@ def merge_underutilized(
         if day_load(target_merch, target_day) + float(row["_VisitMin"]) > daily_capacity:
             return False
         sel = (df["Merchandiser"] == target_merch) & (df["Day"] == target_day)
-        if (df.loc[sel, "Store"] == row["Store"]).any() & (df.loc[sel, "City"] == row["City"]).any():
+        # FIX: same store + same city check must be row-wise (AND), not two independent ANYs
+        same_store_same_city = ((df.loc[sel, "Store"] == row["Store"]) & (df.loc[sel, "City"] == row["City"]))
+        if same_store_same_city.any():
             return False
         if max_km_same_day and max_km_same_day > 0:
             coords = df.loc[sel, ["Lat", "Long"]].dropna()
@@ -763,6 +766,19 @@ def compute_effort_based_merchandisers(
     needed_sched = int(math.ceil(scheduled_minutes / per_merch_capacity)) if per_merch_capacity > 0 else 0
     needed_total = int(math.ceil(total_minutes / per_merch_capacity)) if per_merch_capacity > 0 else 0
     return needed_sched, needed_total, scheduled_minutes, total_minutes
+
+
+def compute_peak_day_merch_need(daily_totals: pd.DataFrame, *, daily_capacity: float) -> int:
+    """
+    Peak-day concurrency need ignoring who does the work:
+    For each Day, sum all minutes across merchs, divide by daily capacity, ceil.
+    Return the maximum across days.
+    """
+    if daily_totals is None or daily_totals.empty:
+        return 0
+    per_day_total = daily_totals.groupby("Day", as_index=False)["DailyMinutes"].sum()
+    per_day_need = np.ceil(per_day_total["DailyMinutes"].to_numpy() / float(daily_capacity))
+    return int(per_day_need.max() if len(per_day_need) else 0)
 
 
 # =========================
@@ -952,16 +968,21 @@ def main():
     dist_label = "Total travel distance (all weeks)" if args.weeks > 1 else "Total weekly travel distance"
     print(f"\n🚗 {dist_label}: {grand_total_km:.1f} km")
 
-    # ---- Effort-based merchandiser count ----
+    # ---- Effort-based merchandiser counts ----
     needed_sched, needed_total, sched_min, total_min = compute_effort_based_merchandisers(
         sched, unsched, daily_capacity=args.daily_capacity, workdays=args.workdays, weeks=args.weeks, default_travel=args.default_travel
     )
+    peak_day_need = compute_peak_day_merch_need(
+        daily_totals=daily_totals, daily_capacity=args.daily_capacity
+    )
+
     print(
         f"\n🧮 Effort-based merchandisers (capacity={args.daily_capacity} min/day × {args.workdays} days × {args.weeks} weeks):"
     )
-    print(f"   • Based on scheduled minutes only: {needed_sched}")
+    print(f"   • Global lower bound (scheduled minutes only): {needed_sched}")
     if unsched is not None and not unsched.empty:
-        print(f"   • Including unscheduled durations: {needed_total}")
+        print(f"   • Global lower bound (incl. unscheduled): {needed_total}")
+    print(f"   • 📈 Peak-day concurrency need: {peak_day_need}")
 
     # ---- Excel output ----
     out_cols = [
@@ -989,14 +1010,15 @@ def main():
         {"Metric": "Weeks", "Value": args.weeks},
         {"Metric": "Total Capacity per Merch (min)", "Value": args.daily_capacity * args.workdays * args.weeks},
         {"Metric": "Scheduled Minutes", "Value": sched_min},
-        {"Metric": "Effort-based Merch (Scheduled)", "Value": needed_sched},
+        {"Metric": "Effort-based Merch (Global LB, Scheduled)", "Value": needed_sched},
+        {"Metric": "Peak-day Effort Merch (Concurrency)", "Value": peak_day_need},
     ]
     if unsched is not None and not unsched.empty:
         effort_rows.extend(
             [
                 {"Metric": "Unscheduled Count", "Value": len(unsched)},
                 {"Metric": "Total Minutes incl. Unscheduled", "Value": total_min},
-                {"Metric": "Effort-based Merch (Incl. Unscheduled)", "Value": needed_total},
+                {"Metric": "Effort-based Merch (Global LB, Incl. Unscheduled)", "Value": needed_total},
             ]
         )
     effort_df = pd.DataFrame(effort_rows)
