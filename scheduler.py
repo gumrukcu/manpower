@@ -4,14 +4,16 @@
 """
 Merchandiser scheduler — strict stickiness, zero over-capacity (auto-expand crews)
 
-What’s new vs prior version:
-- "Same store → same merch" is upheld **without** exceeding daily capacity.
-- If a store cannot fit on its current merch within capacity, we **move that store** to
-  another merch (or **spawn a new merch**) so all its visits fit. No over-cap days.
-- Only unschedules when a **single visit duration > daily_capacity**.
-- Keeps performance knobs: --fast (prefer lighter days), --distance_scope {all_day,adjacent}.
-- Effort-based merch math + peak-day concurrency summary.
-- Vectorized hop-km, deterministic spacing, DBSCAN/KMeans clustering.
+This version adds **even distribution** of visits:
+- If a store's period is **month** and Frequency=F, we aim for **~1 visit per week** when F≈4,
+  more generally we spread visits evenly across the available weeks. Each visit is kept in its
+  target week and prefers a different weekday (spaced within that week).
+- If a store's period is **week** (i.e., Frequency is "per week"), we spread the store's visits
+  **evenly across the weeks** and within each week we space the preferred weekdays to avoid
+  back-to-back days (when possible).
+
+All other logic remains unchanged: capacity/distance rules, fixed pool, stickiness,
+merge step, reporting, etc.
 """
 
 from __future__ import annotations
@@ -228,6 +230,7 @@ def schedule_with_constraints(
     def week_of(day_label: str) -> int:
         return int(day_label.split("-")[0].replace("Week", ""))
 
+    # old helper kept (used elsewhere if needed)
     def evenly_spaced_targets(n_visits: int, total_slots: int, store_key: str) -> List[int]:
         if n_visits <= 0:
             return []
@@ -254,6 +257,54 @@ def schedule_with_constraints(
                 if 0 <= j < total and j not in used:
                     order.append(j); used.add(j)
         return order
+
+    # ===== Even-distribution helpers (new) =====
+    def even_weeks(n_visits: int, n_weeks: int) -> List[int]:
+        """Return 1-based week indices spaced across the horizon."""
+        if n_visits <= 0 or n_weeks <= 0:
+            return []
+        anchors = np.linspace(0, n_weeks - 1, num=n_visits, endpoint=True)
+        weeks_list = [int(round(a)) + 1 for a in anchors]
+        weeks_list = [min(max(1, w), n_weeks) for w in weeks_list]
+        if n_visits <= n_weeks:
+            used, out = set(), []
+            for w in weeks_list:
+                if w not in used:
+                    out.append(w); used.add(w); continue
+                best = None
+                for d in range(1, n_weeks):
+                    for s in (-1, 1):
+                        cand = w + s * d
+                        if 1 <= cand <= n_weeks and cand not in used:
+                            best = cand; break
+                    if best is not None:
+                        break
+                out.append(best if best is not None else w)
+                used.add(out[-1])
+            weeks_list = out
+        return weeks_list
+
+    def split_even(n: int, slots: int) -> List[int]:
+        """Evenly split n items into `slots` buckets (sum == n)."""
+        if slots <= 0:
+            return []
+        base = n // slots
+        rem = n - base * slots
+        counts = [base] * slots
+        for i in range(rem):
+            idx = (i * slots) // rem if rem > 0 else 0
+            counts[idx] += 1
+        return counts
+
+    def spaced_day_rotations(n_in_week: int, workdays: int, base_rot: int) -> List[int]:
+        """Return start indices into the weekday list to space n visits within a week."""
+        if n_in_week <= 0:
+            return []
+        step = workdays / float(n_in_week)
+        offs = [int((i + 0.5) * step) % workdays for i in range(n_in_week)]
+        # rotate by store seed so different stores don't collide
+        offs = [((o + base_rot) % workdays) for o in offs]
+        return offs
 
     # ---- calendars ----
     fixed_mode = bool(fixed_merch_names)
@@ -283,10 +334,8 @@ def schedule_with_constraints(
 
         def _can(day_label: str, v: Dict[str, Any]) -> Tuple[bool, float]:
             slot = shadow[day_label]
-            # avoid same store twice in a day
             if (v["Store"], v["City"]) in cal[day_label]["stores"]:
                 return (False, 0.0)
-            # distance guard
             if max_km_same_day and cal[day_label]["visits"]:
                 if pd.notna(v["Lat"]) and pd.notna(v["Long"]):
                     if distance_scope == "adjacent":
@@ -298,7 +347,6 @@ def schedule_with_constraints(
                             if all(pd.notna([x["Lat"], x["Long"], v["Lat"], v["Long"]])):
                                 if dist_km(x["Lat"], x["Long"], v["Lat"], v["Long"], model=distance_model) > max_km_same_day:
                                     return (False, 0.0)
-            # travel time
             if default_travel is not None:
                 tmin = float(default_travel)
             else:
@@ -307,7 +355,6 @@ def schedule_with_constraints(
                     tmin = (km / avg_speed_kmph) * 60.0
                 else:
                     tmin = 0.0
-            # capacity
             if slot["total"] + v["Duration"] + tmin > daily_capacity:
                 return (False, tmin)
             return (True, tmin)
@@ -317,8 +364,8 @@ def schedule_with_constraints(
         for v in visits:
             cand_lists = []
             if v.get("PreferredDaysOrdered"):
-                cand_lists.append(v["PreferredDaysOrdered"])  # month targets first
-            cand_lists.append([days[(base_rot + k) % L] for k in range(L)])  # rotation fallback
+                cand_lists.append(v["PreferredDaysOrdered"])  # prioritized candidate days
+            cand_lists.append([days[(base_rot + k) % L] for k in range(L)])  # global rotation fallback
 
             placed = False
             for lst in cand_lists:
@@ -326,7 +373,6 @@ def schedule_with_constraints(
                 for dlab in ordered:
                     ok, tmin = _can(dlab, v)
                     if ok:
-                        # update shadow
                         slot = shadow[dlab]
                         slot["total"] += v["Duration"] + tmin
                         if pd.notna(v["Lat"]) and pd.notna(v["Long"]):
@@ -354,24 +400,38 @@ def schedule_with_constraints(
             is_month = (str(row.get("_FreqPeriod", "week")).lower() == "month")
 
             if is_month:
-                targets = evenly_spaced_targets(total_v, L, store_key)
-                for t in targets:
-                    ordered_idx = indices_by_closeness(t, L)
-                    ordered_days = [days[i] for i in ordered_idx]
+                # ---- MONTHLY: spread across weeks, one per week when possible ----
+                target_weeks = even_weeks(total_v, weeks)
+                base_rot = _stable_id(store_key) % workdays
+                for i, wk in enumerate(target_weeks):
+                    # rotate preferred weekday for each monthly visit
+                    day_order = day_names[base_rot:] + day_names[:base_rot]
+                    start = (i * (workdays // max(1, len(target_weeks)))) % workdays
+                    week_days = [f"Week{wk}-{d}" for d in (day_order[start:] + day_order[:start])]
                     tasks_by_store[(store_name, city_name)].append({
                         "Store": store_name, "City": city_name, "Cluster": int(cluster_id),
                         "Duration": float(row["Estimated Duration In a store"]),
                         "Lat": row.get("Lat", np.nan), "Long": row.get("Long", np.nan),
-                        "PreferredDaysOrdered": ordered_days, "Monthly": True, "TotalV": total_v,
+                        "PreferredDaysOrdered": week_days, "Monthly": True, "TotalV": total_v,
                     })
             else:
-                for _ in range(total_v):
-                    tasks_by_store[(store_name, city_name)].append({
-                        "Store": store_name, "City": city_name, "Cluster": int(cluster_id),
-                        "Duration": float(row["Estimated Duration In a store"]),
-                        "Lat": row.get("Lat", np.nan), "Long": row.get("Long", np.nan),
-                        "PreferredDaysOrdered": None, "Monthly": False, "TotalV": total_v,
-                    })
+                # ---- WEEKLY: distribute per-week and space days within week ----
+                per_week_counts = split_even(total_v, weeks)
+                base_rot = _stable_id(store_key) % workdays
+                for wk_idx, n_in_week in enumerate(per_week_counts, start=1):
+                    if n_in_week <= 0:
+                        continue
+                    # choose spaced start offsets for each visit within the week
+                    starts = spaced_day_rotations(n_in_week, workdays, base_rot)
+                    day_order_base = day_names  # canonical
+                    for s in starts:
+                        week_days = [f"Week{wk_idx}-{d}" for d in (day_order_base[s:] + day_order_base[:s])]
+                        tasks_by_store[(store_name, city_name)].append({
+                            "Store": store_name, "City": city_name, "Cluster": int(cluster_id),
+                            "Duration": float(row["Estimated Duration In a store"]),
+                            "Lat": row.get("Lat", np.nan), "Long": row.get("Long", np.nan),
+                            "PreferredDaysOrdered": week_days, "Monthly": False, "TotalV": total_v,
+                        })
 
         for (store, city), visits in tasks_by_store.items():
             skey = f"{store}|{city}"
@@ -379,11 +439,11 @@ def schedule_with_constraints(
 
             # candidate merch pool
             if fixed_mode:
-                merch_pool = list(merch_schedules.keys())  # must use from pool
+                merch_pool = list(merch_schedules.keys())
             else:
-                merch_pool = list(merch_schedules.keys())  # any existing
+                merch_pool = list(merch_schedules.keys())
 
-            best_choice: Optional[Tuple[str, List[Tuple[str, float]], float]] = None  # (merch, plan, added_total)
+            best_choice: Optional[Tuple[str, List[Tuple[str, float]], float]] = None
 
             for merch in merch_pool:
                 cal = merch_schedules[merch]
@@ -396,11 +456,10 @@ def schedule_with_constraints(
                 if plan is not None:
                     added = 0.0
                     for (dlab, tmin), v in zip(plan, visits):
-                        added += cal[dlab]["total"] + v["Duration"] + tmin  # simple score
+                        added += cal[dlab]["total"] + v["Duration"] + tmin
                     if (best_choice is None) or (added < best_choice[2]):
                         best_choice = (merch, plan, added)
 
-            # if none fits, spawn a new merch (unless fixed pool)
             if best_choice is None and not fixed_mode:
                 new_merch = f"Merch_{len(merch_schedules) + 1}"
                 merch_schedules[new_merch] = {d: {"total": 0.0, "visits": [], "stores": set(), "last_lat": None, "last_lon": None} for d in days}
@@ -415,7 +474,6 @@ def schedule_with_constraints(
                     added = sum(cal[dlab]["total"] + v["Duration"] + tmin for (dlab, tmin), v in zip(plan, visits))
                     best_choice = (new_merch, plan, added)
 
-            # still none? ⇒ only impossible if a single visit > capacity
             if best_choice is None:
                 for v in visits:
                     if float(v["Duration"]) > float(daily_capacity):
@@ -426,7 +484,6 @@ def schedule_with_constraints(
                         })
                 continue
 
-            # commit chosen plan to chosen merch
             merch, plan, _ = best_choice
             cal = merch_schedules[merch]
             for v, (day_label, tmin) in zip(visits, plan):
