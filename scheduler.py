@@ -4,16 +4,11 @@
 """
 Merchandiser scheduler — strict stickiness, zero over-capacity (auto-expand crews)
 
-This version adds **even distribution** of visits:
-- If a store's period is **month** and Frequency=F, we aim for **~1 visit per week** when F≈4,
-  more generally we spread visits evenly across the available weeks. Each visit is kept in its
-  target week and prefers a different weekday (spaced within that week).
-- If a store's period is **week** (i.e., Frequency is "per week"), we spread the store's visits
-  **evenly across the weeks** and within each week we space the preferred weekdays to avoid
-  back-to-back days (when possible).
-
-All other logic remains unchanged: capacity/distance rules, fixed pool, stickiness,
-merge step, reporting, etc.
+This version adds **land (road) distance** support via OSRM without touching other logic:
+- New CLI flags: `--road_engine {none,osrm}` and `--router_url` (default public OSRM).
+- When `--road_engine osrm` is provided, distance/time use **driving distance** (ferry excluded),
+  otherwise we keep your existing straight-line models.
+- All other behavior stays the same (even visit distribution, capacity rules, fixed pool, reporting, etc.).
 """
 
 from __future__ import annotations
@@ -89,8 +84,49 @@ def cached_haversine(lat1, lon1, lat2, lon2) -> float:
 def _stable_id(s: str) -> int:
     return int(md5(s.encode("utf-8")).hexdigest()[:8], 16)
 
+# ---- Road (OSRM) distance support ----
 
-def dist_km(lat1, lon1, lat2, lon2, model: str) -> float:
+def _round5(x: float) -> float:
+    return round(float(x), 5)
+
+@lru_cache(maxsize=200_000)
+def _osrm_distance_km_cached(lat1, lon1, lat2, lon2, base_url: str) -> float:
+    """Query OSRM once per origin-destination with rounding + LRU cache.
+    Returns NaN on failure so caller can fallback."""
+    try:
+        import requests  # local import so script works without requests when road_engine=none
+        url = f"{base_url.rstrip('/')}/route/v1/driving/{_round5(lon1)},{_round5(lat1)};{_round5(lon2)},{_round5(lat2)}"
+        params = {
+            "overview": "false",
+            "alternatives": "false",
+            "steps": "false",
+            "annotations": "distance",
+            "exclude": "ferry",  # avoid sea routes
+            "continue_straight": "true",
+        }
+        r = requests.get(url, params=params, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("routes") and data["routes"][0].get("distance") is not None:
+            return float(data["routes"][0]["distance"]) / 1000.0
+    except Exception:
+        pass
+    return float("nan")
+
+
+def road_distance_km(lat1, lon1, lat2, lon2, engine: Optional[str], base_url: Optional[str]) -> Optional[float]:
+    if engine == "osrm" and base_url:
+        km = _osrm_distance_km_cached(_round5(lat1), _round5(lon1), _round5(lat2), _round5(lon2), base_url)
+        if not math.isnan(km):
+            return km
+    return None
+
+
+def dist_km(lat1, lon1, lat2, lon2, model: str, *, road_engine: Optional[str] = None, router_url: Optional[str] = None) -> float:
+    """Return distance in km. If road_engine is enabled, prefer road distance; otherwise fall back."""
+    km = road_distance_km(lat1, lon1, lat2, lon2, road_engine, router_url)
+    if km is not None:
+        return km
     if model == "haversine":
         return cached_haversine(lat1, lon1, lat2, lon2)
     return cached_distance(lat1, lon1, lat2, lon2)
@@ -189,6 +225,8 @@ def schedule_with_constraints(
     fixed_strict_capacity: bool = False,
     distance_scope: str = "all_day",
     fast: bool = False,
+    road_engine: str = "none",
+    router_url: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df = full_df.copy()
 
@@ -230,7 +268,6 @@ def schedule_with_constraints(
     def week_of(day_label: str) -> int:
         return int(day_label.split("-")[0].replace("Week", ""))
 
-    # old helper kept (used elsewhere if needed)
     def evenly_spaced_targets(n_visits: int, total_slots: int, store_key: str) -> List[int]:
         if n_visits <= 0:
             return []
@@ -258,9 +295,8 @@ def schedule_with_constraints(
                     order.append(j); used.add(j)
         return order
 
-    # ===== Even-distribution helpers (new) =====
+    # ===== Even-distribution helpers =====
     def even_weeks(n_visits: int, n_weeks: int) -> List[int]:
-        """Return 1-based week indices spaced across the horizon."""
         if n_visits <= 0 or n_weeks <= 0:
             return []
         anchors = np.linspace(0, n_weeks - 1, num=n_visits, endpoint=True)
@@ -285,7 +321,6 @@ def schedule_with_constraints(
         return weeks_list
 
     def split_even(n: int, slots: int) -> List[int]:
-        """Evenly split n items into `slots` buckets (sum == n)."""
         if slots <= 0:
             return []
         base = n // slots
@@ -297,12 +332,10 @@ def schedule_with_constraints(
         return counts
 
     def spaced_day_rotations(n_in_week: int, workdays: int, base_rot: int) -> List[int]:
-        """Return start indices into the weekday list to space n visits within a week."""
         if n_in_week <= 0:
             return []
         step = workdays / float(n_in_week)
         offs = [int((i + 0.5) * step) % workdays for i in range(n_in_week)]
-        # rotate by store seed so different stores don't collide
         offs = [((o + base_rot) % workdays) for o in offs]
         return offs
 
@@ -324,9 +357,8 @@ def schedule_with_constraints(
         merch: str, visits: List[Dict[str, Any]], *, cal: Dict[str, Any], skey: str,
         base_rot_seed: int, max_km_same_day: float, distance_model: str,
         avg_speed_kmph: float, default_travel: Optional[float], daily_capacity: float,
-        distance_scope: str, fast: bool
+        distance_scope: str, fast: bool, road_engine: str, router_url: Optional[str]
     ) -> Optional[List[Tuple[str, float]]]:
-        # shadow copy of per-day state (to test feasibility without committing)
         shadow = {d: {"total": float(cal[d]["total"]),
                       "last_lat": cal[d]["last_lat"],
                       "last_lon": cal[d]["last_lon"],
@@ -340,18 +372,18 @@ def schedule_with_constraints(
                 if pd.notna(v["Lat"]) and pd.notna(v["Long"]):
                     if distance_scope == "adjacent":
                         if slot["last_lat"] is not None and slot["last_lon"] is not None:
-                            if dist_km(slot["last_lat"], slot["last_lon"], v["Lat"], v["Long"], model=distance_model) > max_km_same_day:
+                            if dist_km(slot["last_lat"], slot["last_lon"], v["Lat"], v["Long"], model=distance_model, road_engine=road_engine, router_url=router_url) > max_km_same_day:
                                 return (False, 0.0)
                     else:
                         for x in cal[day_label]["visits"]:
                             if all(pd.notna([x["Lat"], x["Long"], v["Lat"], v["Long"]])):
-                                if dist_km(x["Lat"], x["Long"], v["Lat"], v["Long"], model=distance_model) > max_km_same_day:
+                                if dist_km(x["Lat"], x["Long"], v["Lat"], v["Long"], model=distance_model, road_engine=road_engine, router_url=router_url) > max_km_same_day:
                                     return (False, 0.0)
             if default_travel is not None:
                 tmin = float(default_travel)
             else:
                 if slot["last_lat"] is not None and slot["last_lon"] is not None and pd.notna(v["Lat"]) and pd.notna(v["Long"]):
-                    km = dist_km(slot["last_lat"], slot["last_lon"], v["Lat"], v["Long"], model=distance_model)
+                    km = dist_km(slot["last_lat"], slot["last_lon"], v["Lat"], v["Long"], model=distance_model, road_engine=road_engine, router_url=router_url)
                     tmin = (km / avg_speed_kmph) * 60.0
                 else:
                     tmin = 0.0
@@ -400,11 +432,10 @@ def schedule_with_constraints(
             is_month = (str(row.get("_FreqPeriod", "week")).lower() == "month")
 
             if is_month:
-                # ---- MONTHLY: spread across weeks, one per week when possible ----
+                # MONTHLY: spread across weeks, one per week when possible
                 target_weeks = even_weeks(total_v, weeks)
                 base_rot = _stable_id(store_key) % workdays
                 for i, wk in enumerate(target_weeks):
-                    # rotate preferred weekday for each monthly visit
                     day_order = day_names[base_rot:] + day_names[:base_rot]
                     start = (i * (workdays // max(1, len(target_weeks)))) % workdays
                     week_days = [f"Week{wk}-{d}" for d in (day_order[start:] + day_order[:start])]
@@ -415,15 +446,14 @@ def schedule_with_constraints(
                         "PreferredDaysOrdered": week_days, "Monthly": True, "TotalV": total_v,
                     })
             else:
-                # ---- WEEKLY: distribute per-week and space days within week ----
+                # WEEKLY: distribute per-week and space days within week
                 per_week_counts = split_even(total_v, weeks)
                 base_rot = _stable_id(store_key) % workdays
                 for wk_idx, n_in_week in enumerate(per_week_counts, start=1):
                     if n_in_week <= 0:
                         continue
-                    # choose spaced start offsets for each visit within the week
                     starts = spaced_day_rotations(n_in_week, workdays, base_rot)
-                    day_order_base = day_names  # canonical
+                    day_order_base = day_names
                     for s in starts:
                         week_days = [f"Week{wk_idx}-{d}" for d in (day_order_base[s:] + day_order_base[:s])]
                         tasks_by_store[(store_name, city_name)].append({
@@ -437,7 +467,6 @@ def schedule_with_constraints(
             skey = f"{store}|{city}"
             base_rot = _stable_id(skey) % L
 
-            # candidate merch pool
             if fixed_mode:
                 merch_pool = list(merch_schedules.keys())
             else:
@@ -452,6 +481,7 @@ def schedule_with_constraints(
                     max_km_same_day=max_km_same_day, distance_model=distance_model,
                     avg_speed_kmph=avg_speed_kmph, default_travel=default_travel,
                     daily_capacity=daily_capacity, distance_scope=distance_scope, fast=fast,
+                    road_engine=road_engine, router_url=router_url,
                 )
                 if plan is not None:
                     added = 0.0
@@ -469,6 +499,7 @@ def schedule_with_constraints(
                     max_km_same_day=max_km_same_day, distance_model=distance_model,
                     avg_speed_kmph=avg_speed_kmph, default_travel=default_travel,
                     daily_capacity=daily_capacity, distance_scope=distance_scope, fast=fast,
+                    road_engine=road_engine, router_url=router_url,
                 )
                 if plan is not None:
                     added = sum(cal[dlab]["total"] + v["Duration"] + tmin for (dlab, tmin), v in zip(plan, visits))
@@ -596,27 +627,16 @@ def merge_underutilized(schedule_df: pd.DataFrame, *, daily_capacity: float, max
 # Travel km per day & weekly totals
 # =========================
 
-def compute_day_km(sched_df: pd.DataFrame, *, distance_model: str):
+def compute_day_km(sched_df: pd.DataFrame, *, distance_model: str, road_engine: str, router_url: Optional[str]):
     df = sched_df.sort_values(["Merchandiser", "Day", "Seq"]).copy()
     df["PrevLat"] = df.groupby(["Merchandiser", "Day"])["Lat"].shift()
     df["PrevLon"] = df.groupby(["Merchandiser", "Day"])["Long"].shift()
     mask = df[["Lat", "Long", "PrevLat", "PrevLon"]].notna().all(axis=1)
     df["HopKM"] = 0.0
     if mask.any():
-        if distance_model == "haversine":
-            R = 6371.0088
-            phi1 = np.radians(df.loc[mask, "PrevLat"].astype(float).to_numpy())
-            phi2 = np.radians(df.loc[mask, "Lat"].astype(float).to_numpy())
-            dphi = phi2 - phi1
-            lam1 = np.radians(df.loc[mask, "PrevLon"].astype(float).to_numpy())
-            lam2 = np.radians(df.loc[mask, "Long"].astype(float).to_numpy())
-            dlam = lam2 - lam1
-            a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2) ** 2
-            df.loc[mask, "HopKM"] = 2 * R * np.arcsin(np.sqrt(a))
-        else:
-            idx = df.index[mask]
-            for i in idx:
-                df.at[i, "HopKM"] = dist_km(df.at[i, "PrevLat"], df.at[i, "PrevLon"], df.at[i, "Lat"], df.at[i, "Long"], model=distance_model)
+        idx = df.index[mask]
+        for i in idx:
+            df.at[i, "HopKM"] = dist_km(df.at[i, "PrevLat"], df.at[i, "PrevLon"], df.at[i, "Lat"], df.at[i, "Long"], model=distance_model, road_engine=road_engine, router_url=router_url)
     day_km = df.groupby(["Merchandiser", "Day"], as_index=False)["HopKM"].sum().rename(columns={"HopKM": "DayKM"})
     merch_km = day_km.groupby("Merchandiser", as_index=False)["DayKM"].sum().rename(columns={"DayKM": "TotalKM"})
     return df.drop(columns=["PrevLat", "PrevLon"]), day_km, merch_km
@@ -697,6 +717,9 @@ def main():
     p.add_argument("--fixed_strict_capacity", action="store_true", help="(Fixed pool only) never exceed daily_capacity; unplaceable ⇒ Unscheduled")
     p.add_argument("--distance_scope", choices=["all_day", "adjacent"], default="all_day")
     p.add_argument("--fast", action="store_true")
+    # NEW: road distance controls
+    p.add_argument("--road_engine", choices=["none", "osrm"], default="none", help="Use road-network routing for distances")
+    p.add_argument("--router_url", type=str, default="https://router.project-osrm.org", help="OSRM base URL")
 
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(message)s")
@@ -731,6 +754,8 @@ def main():
         fixed_strict_capacity=args.fixed_strict_capacity,
         distance_scope=args.distance_scope,
         fast=args.fast,
+        road_engine=args.road_engine,
+        router_url=args.router_url,
     )
 
     before = sched["Merchandiser"].nunique() if not sched.empty else 0
@@ -770,7 +795,7 @@ def main():
     for _, r in workload_summary.sort_values("Merchandiser").iterrows():
         print(f"- {r['Merchandiser']}: avg/day={int(round(r['AvgMinutesPerActiveDay']))} min, avg/week={int(round(r['AvgMinutesPerWeek']))} min")
 
-    sched, day_km, merch_km = compute_day_km(sched, distance_model=args.distance_model)
+    sched, day_km, merch_km = compute_day_km(sched, distance_model=args.distance_model, road_engine=args.road_engine, router_url=args.router_url)
     grand_total_km = float(merch_km["TotalKM"].sum()) if not merch_km.empty else 0.0
     print(f"\n🚗 Total travel distance: {grand_total_km:.1f} km")
 
