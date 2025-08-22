@@ -12,7 +12,7 @@ from streamlit_folium import st_folium
 # ======================
 # Config & simple styles
 # ======================
-SCRIPT_PATH = os.environ.get("SCHEDULER_SCRIPT", "scheduler.py")  # your updated script (e.g., merch_scheduler_fast.py)
+SCRIPT_PATH = os.environ.get("SCHEDULER_SCRIPT", "scheduler.py")  # your updated script
 DEFAULT_OUTPUT_NAME = "schedule_output.xlsx"
 PAGE_TITLE = "Merchandiser Scheduler"
 PAGE_ICON = "📅"
@@ -71,7 +71,7 @@ def build_cli_args(params: dict) -> list[str]:
         add_flag("--cluster_radius_km", params["cluster_radius_km"])
     add_flag("--distance_model", params["distance_model"])
 
-    # ➕ NEW: distance scope & fast heuristics
+    # NEW: distance scope + fast heuristic
     add_flag("--distance_scope", params["distance_scope"])  # all_day | adjacent
     if params.get("fast", False):
         args.append("--fast")
@@ -93,6 +93,11 @@ def build_cli_args(params: dict) -> list[str]:
     if params.get("fixed_strict_capacity", False):
         args.append("--fixed_strict_capacity")
 
+    # NEW: Road distance (land) options
+    add_flag("--road_engine", params["road_engine"])  # none | osrm
+    if params["road_engine"] != "none":
+        add_flag("--router_url", params["router_url"])  # only when using OSRM
+
     add_flag("--cache_precision", params["cache_precision"])
     if params["verbose"]:
         args.append("--verbose")
@@ -106,7 +111,6 @@ def week_key(day_str: str):
     return (int(m.group(1)) if m else 1, str(day_str))
 
 def color_for_merch(name: str):
-    # deterministic soft color per merch
     h = md5(str(name).encode("utf-8")).hexdigest()
     r = 100 + (int(h[0:2], 16) % 156)
     g = 100 + (int(h[2:4], 16) % 156)
@@ -114,7 +118,6 @@ def color_for_merch(name: str):
     return "#{:02x}{:02x}{:02x}".format(r, g, b)
 
 def to_numeric_latlon(df: pd.DataFrame):
-    # Coerce non-numeric / comma-decimal
     for col in ["Lat", "Long"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.replace(",", ".", regex=False)
@@ -123,13 +126,11 @@ def to_numeric_latlon(df: pd.DataFrame):
 
 def fit_bounds(df: pd.DataFrame):
     if df.empty or df["Lat"].isna().all() or df["Long"].isna().all():
-        # world-ish
         return [[-60, -130], [60, 130]], [0.0, 0.0], 2
     lat_min, lat_max = float(df["Lat"].min()), float(df["Lat"].max())
     lon_min, lon_max = float(df["Long"].min()), float(df["Long"].max())
     center = [(lat_min + lat_max) / 2.0, (lon_min + lon_max) / 2.0]
     bounds = [[lat_min, lon_min], [lat_max, lon_max]]
-    # crude zoom heuristic
     span = max(lat_max - lat_min, lon_max - lon_min, 0.0001)
     zoom = max(2, min(14, int(12 - math.log(max(span, 1e-4), 2) - 1)))
     return bounds, center, zoom
@@ -154,7 +155,6 @@ def build_leaflet(schedule_df: pd.DataFrame,
     bounds, center, zoom = fit_bounds(df)
     fmap = folium.Map(location=center, zoom_start=zoom, tiles="CartoDB Positron")
 
-    # Draw by (Merchandiser, Day)
     for (m_id, day), g in df.sort_values(["Merchandiser", "Day", "Seq"]) \
                             .groupby(["Merchandiser", "Day"], sort=False):
         color = color_for_merch(m_id)
@@ -171,7 +171,6 @@ def build_leaflet(schedule_df: pd.DataFrame,
                 tooltip=f'{r.get("Store","")}\n{r.get("City","")}\n{m_id} • Seq {r.get("Seq","")}'
             ).add_to(fmap)
 
-    # fit to bounds (if not degenerate)
     if bounds != [[-60, -130], [60, 130]]:
         fmap.fit_bounds(bounds, padding=(10, 10))
     return fmap, df
@@ -205,7 +204,6 @@ if view == "map":
         unsafe_allow_html=True
     )
 
-    # get latest schedule from session or allow upload
     xlsx_bytes = st.session_state.get("last_xlsx_bytes")
     if xlsx_bytes is None:
         up2 = st.file_uploader("Upload a generated Schedule .xlsx (sheet: 'Schedule')", type=["xlsx"], key="map_uploader")
@@ -227,20 +225,16 @@ if view == "map":
         st.dataframe(sched_df.head())
         st.stop()
 
-    # ----------------- STRICTLY CASCADING FILTERS -----------------
     def multiselect_cascade(label, key, options, *, default_all=True, dependents=(), sort_key=None):
         opts = list(options) if options is not None else []
         if sort_key:
             opts = sorted(opts, key=sort_key)
         else:
             opts = sorted(opts)
-
         prev = st.session_state.get(key)
-        if prev is None or any(v not in opts for v in prev):
+        if prev is None or any(v not in opts for v in prev or []):
             st.session_state[key] = opts if default_all else []
-
         val = st.multiselect(label, opts, default=st.session_state[key], key=key)
-
         if set(val) != set(prev or []):
             for dep in dependents:
                 st.session_state.pop(dep, None)
@@ -293,9 +287,7 @@ if view == "map":
             dependents=(),
             sort_key=week_key,
         )
-    # ------------------------------------------------------
 
-    # Build & render Leaflet map
     fmap, filtered_df = build_leaflet(
         sched_df,
         merch_filter=sel_merch,
@@ -329,7 +321,6 @@ else:
         )
         st.caption("Tip: Use a 'Frequency Period' column (week/month) for per-row overrides. Otherwise choose it in the sidebar.")
 
-    # Sidebar params
     with st.sidebar:
         st.header("Parameters")
         weeks = st.number_input("Weeks to schedule", min_value=1, max_value=52, value=4)
@@ -351,18 +342,23 @@ else:
         cluster_radius_km = st.text_input("Radius (km) for DBSCAN (if radius mode)", value="")
 
         st.divider(); st.subheader("Distance & Frequency")
-        distance_model = st.selectbox("Distance model", options=["haversine","euclidean"], index=0)
-        # ➕ NEW controls
-        distance_scope = st.selectbox(
-            "Same-day distance scope",
-            options=["all_day", "adjacent"],
-            index=1,
-            help="'all_day' checks new stops against all prior stops that day; 'adjacent' checks only the last placed stop (faster).",
-        )
-        fast = st.checkbox("Enable fast heuristics", value=True, help="Try lighter days first and prune obviously over-capacity days.")
-
+        distance_model = st.selectbox("Distance model (fallback)", options=["haversine","euclidean","geodesic"], index=0,
+                                      help="Used when road routing is off or unavailable.")
+        distance_scope = st.selectbox("Same-day distance scope", options=["all_day","adjacent"], index=0,
+                                      help="adjacent = only compare with previous stop; all_day = compare with every same-day stop.")
+        fast = st.checkbox("Fast placement heuristic", value=True, help="Prefer lighter days first when placing visits.")
         frequency_period = st.selectbox("Interpret 'Frequency' values as", options=["week","month"], index=0)
         month_weeks = st.number_input("Weeks per month (used when 'month')", min_value=1.0, max_value=6.0, value=4.345, step=0.005, format="%.3f")
+
+        st.divider(); st.subheader("Road distance (land)")
+        use_road = st.checkbox("Use road-network distance (OSRM)", value=False,
+                               help="When enabled, the planner queries OSRM driving distance (ferries excluded).")
+        if use_road:
+            road_engine = "osrm"
+            router_url = st.text_input("OSRM router URL", value="https://router.project-osrm.org")
+        else:
+            road_engine = "none"
+            router_url = ""
 
         st.divider(); st.subheader("Merchandisers (optional)")
         use_fixed_pool = st.checkbox("Use a fixed merch pool (exact count or explicit names)", value=False)
@@ -413,16 +409,15 @@ else:
                 speed=speed, default_travel_set=default_travel_set, default_travel=default_travel,
                 max_km_same_day=max_km_same_day, strict_same_merch=strict_same_merch,
                 clusters=clusters.strip(), cluster_mode=cluster_mode, cluster_radius_km=cluster_radius_km.strip(),
-                distance_model=distance_model,
-                # NEW
-                distance_scope=distance_scope, fast=fast,
-                # Frequency
+                distance_model=distance_model, distance_scope=distance_scope, fast=fast,
                 frequency_period=frequency_period, month_weeks=month_weeks,
                 # Fixed merch pool
                 merch_mode=merch_mode, merch_count=merch_count, merch_names=merch_names,
                 fixed_strict_capacity=fixed_strict_capacity,
                 # Merge & misc
                 merge_utilization_threshold=merge_utilization_threshold, merge_cross_cluster=merge_cross_cluster,
+                # Road distance
+                road_engine=road_engine, router_url=router_url,
                 cache_precision=cache_precision, verbose=verbose,
             )
             cli_args = [sys.executable, SCRIPT_PATH] + build_cli_args(params)
