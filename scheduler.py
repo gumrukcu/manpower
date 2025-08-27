@@ -624,6 +624,7 @@ def merge_underutilized(schedule_df: pd.DataFrame, *, daily_capacity: float, max
     return df.drop(columns=["_VisitMin"], errors="ignore")
 
 
+
 # =========================
 # Travel km per day & weekly totals
 # =========================
@@ -642,6 +643,93 @@ def compute_day_km(sched_df: pd.DataFrame, *, distance_model: str, road_engine: 
     merch_km = day_km.groupby("Merchandiser", as_index=False)["DayKM"].sum().rename(columns={"DayKM": "TotalKM"})
     return df.drop(columns=["PrevLat", "PrevLon"]), day_km, merch_km
 
+def compress_days(
+    sched_df: pd.DataFrame,
+    *,
+    daily_capacity: float,
+    max_km_same_day: float,
+    distance_scope: str,
+    distance_model: str,
+    road_engine: str,
+    router_url: Optional[str],
+) -> pd.DataFrame:
+    if sched_df is None or sched_df.empty:
+        return sched_df
+
+    cols = sched_df.columns
+    df = sched_df.sort_values(["Merchandiser", "Day", "Seq"]).copy()
+
+    out_rows = []
+
+    for merch, g in df.groupby("Merchandiser"):
+        # reuse the existing set of day labels for this merch
+        day_labels = sorted(g["Day"].unique().tolist())
+        bins = {d: [] for d in day_labels}
+        loads = {d: 0.0 for d in day_labels}  # minutes per day we pack
+        last_latlon = {d: (None, None) for d in day_labels}  # for adjacent scope
+
+        # Try to pack: for each visit, put it on the MOST loaded day that still fits
+        # (this densifies days and frees whole empty days)
+        for _, r in g.iterrows():
+            visit_minutes = float(pd.to_numeric(r.get("Duration", 0.0), errors="coerce") +
+                                  pd.to_numeric(r.get("ActualTravel", 0.0), errors="coerce"))
+            r_lat, r_lon = r.get("Lat", np.nan), r.get("Long", np.nan)
+
+            placed = False
+            for d in sorted(day_labels, key=lambda x: loads[x], reverse=True):
+                # capacity check
+                if loads[d] + visit_minutes > daily_capacity:
+                    continue
+
+                # distance guard
+                ok = True
+                if max_km_same_day and max_km_same_day > 0 and pd.notna(r_lat) and pd.notna(r_lon):
+                    if distance_scope == "all_day":
+                        # must be within radius from every other visit on that day
+                        for x in bins[d]:
+                            if all(pd.notna([x.get("Lat"), x.get("Long"), r_lat, r_lon])):
+                                if dist_km(x["Lat"], x["Long"], r_lat, r_lon,
+                                           model=distance_model, road_engine=road_engine, router_url=router_url) > max_km_same_day:
+                                    ok = False; break
+                    else:
+                        # adjacent scope: only check vs. last placed stop on that day
+                        last = last_latlon[d]
+                        if all(v is not None for v in last) and pd.notna(r_lat) and pd.notna(r_lon):
+                            if dist_km(last[0], last[1], r_lat, r_lon,
+                                       model=distance_model, road_engine=road_engine, router_url=router_url) > max_km_same_day:
+                                ok = False
+                if not ok:
+                    continue
+
+                # place on day d
+                bins[d].append(r.to_dict())
+                loads[d] += visit_minutes
+                if pd.notna(r_lat) and pd.notna(r_lon):
+                    last_latlon[d] = (float(r_lat), float(r_lon))
+                placed = True
+                break
+
+            if not placed:
+                # fallback: keep its original day
+                d = r["Day"]
+                bins[d].append(r.to_dict())
+                loads[d] += visit_minutes
+                if pd.notna(r_lat) and pd.notna(r_lon):
+                    last_latlon[d] = (float(r_lat), float(r_lon))
+
+        # re-sequence within day and append
+        for d in day_labels:
+            for i, rec in enumerate(bins[d], start=1):
+                rec["Day"] = d
+                rec["Seq"] = i
+                out_rows.append(rec)
+
+    packed = pd.DataFrame(out_rows)
+    # ensure we preserve original columns
+    for c in cols:
+        if c not in packed.columns:
+            packed[c] = np.nan
+    return packed[cols]
 
 # =========================
 # Helpers
@@ -721,6 +809,9 @@ def main():
     # NEW: road distance controls
     p.add_argument("--road_engine", choices=["none", "osrm"], default="none", help="Use road-network routing for distances")
     p.add_argument("--router_url", type=str, default="https://router.project-osrm.org", help="OSRM base URL")
+    p.add_argument("--compress_days",action="store_true",help="After initial scheduling, fold each merch's visits into the fewest days possible without breaking capacity/distance rules."
+)
+
 
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(message)s")
@@ -758,6 +849,18 @@ def main():
         road_engine=args.road_engine,
         router_url=args.router_url,
     )
+
+    # NEW: optional day compression
+    if args.compress_days and not sched.empty:
+        sched = compress_days(
+            sched,
+            daily_capacity=args.daily_capacity,
+            max_km_same_day=args.max_km_same_day,
+            distance_scope=args.distance_scope,
+            distance_model=args.distance_model,
+            road_engine=args.road_engine,
+            router_url=args.router_url,
+        )
 
     before = sched["Merchandiser"].nunique() if not sched.empty else 0
     if not fixed_names and args.merge_utilization_threshold > 0:
