@@ -101,6 +101,8 @@ def build_cli_args(params: dict) -> list[str]:
     add_flag("--cache_precision", params["cache_precision"])
     if params["verbose"]:
         args.append("--verbose")
+    # NEW: compress-days post-pass
+    add_flag("--compress_days", params.get("compress_days", False))
     return args
 
 # ===============
@@ -384,6 +386,13 @@ else:
             fixed_strict_capacity = False
 
         st.divider(); st.subheader("Merge underutilized")
+        st.divider(); st.subheader("Post-processing")
+        compress_days = st.checkbox(
+            "Compress days after scheduling",
+            value=False,
+            help="Pack each merch's visits into as few days as possible without breaking capacity & distance rules."
+        )
+
         merge_utilization_threshold = st.slider("Utilization threshold (0 disables)", 0.0, 1.0, 0.0, 0.05)
         merge_cross_cluster = st.checkbox("Allow cross-cluster merge", value=False)
 
@@ -419,6 +428,7 @@ else:
                 # Road distance
                 road_engine=road_engine, router_url=router_url,
                 cache_precision=cache_precision, verbose=verbose,
+                compress_days=compress_days,
             )
             cli_args = [sys.executable, SCRIPT_PATH] + build_cli_args(params)
             st.write("**Command**:", " ".join(cli_args))
