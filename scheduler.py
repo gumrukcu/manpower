@@ -401,7 +401,8 @@ def schedule_with_constraints(
 
             placed = False
             for lst in cand_lists:
-                ordered = sorted(lst, key=lambda d: shadow[d]["total"]) if fast else lst
+                # Densify: fill already-used days before opening a new one
+                ordered = sorted(lst, key=lambda d: shadow[d]["total"], reverse=True)
                 for dlab in ordered:
                     ok, tmin = _can(dlab, v)
                     if ok:
